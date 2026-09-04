@@ -48,6 +48,16 @@ Every IOC is submitted with:
                   (falls back to the DEFAULT_NOTE constant below if a
                   block omits "description" or leaves it blank)
 
+CSV to JSON conversion (menu option 3):
+
+    A CSV file with "type", "indicator" and (optional) "description"
+    columns can be converted into the input JSON shown above. Defanged
+    indicators (hxxp://, hxxps://, "[.]") are re-fanged automatically,
+    and every row is validated the same way a block request is
+    (IP/URL/DOMAIN/SHA1/SHA256 format checks) before it is written to
+    the output JSON - rows that fail validation are reported and
+    skipped rather than being silently written out.
+
 JWT:
     Created manually using Python standard library.
     No PyJWT / python-jose required.
@@ -76,6 +86,7 @@ The program will display a menu.
 
 
 import base64
+import csv
 import hashlib
 import hmac
 import ipaddress
@@ -534,6 +545,42 @@ def normalize_type(value):
 
 
 # ============================================================
+# VALIDATE VALUE BY TYPE
+# ============================================================
+
+def validate_value_for_type(ioc_type, value):
+    """
+    Runs the type-specific format check (IP/URL/DOMAIN/SHA1/SHA256)
+    for a single IOC value and returns its normalized form.
+
+    Shared by validate_ioc() (JSON input) and csv_to_json()
+    (CSV input) so both paths enforce the exact same rules -
+    an IP must look like an IP, a URL like a URL, a hash like a
+    hash, before it is ever written out or submitted.
+    """
+
+    if ioc_type == "IP":
+        return validate_ip(value)
+
+    if ioc_type == "URL":
+        return validate_url(value)
+
+    if ioc_type == "DOMAIN":
+        return validate_domain(value)
+
+    if ioc_type == "SHA1":
+        return validate_sha1(value)
+
+    if ioc_type == "SHA256":
+        return validate_sha256(value)
+
+    raise ValueError(
+        "Unsupported IOC type: "
+        + str(ioc_type)
+    )
+
+
+# ============================================================
 # NORMALIZE NOTE
 # ============================================================
 
@@ -594,20 +641,10 @@ def validate_ioc(item):
             "IOC value must be a string."
         )
 
-    if ioc_type == "IP":
-        value = validate_ip(value)
-
-    elif ioc_type == "URL":
-        value = validate_url(value)
-
-    elif ioc_type == "DOMAIN":
-        value = validate_domain(value)
-
-    elif ioc_type == "SHA1":
-        value = validate_sha1(value)
-
-    elif ioc_type == "SHA256":
-        value = validate_sha256(value)
+    value = validate_value_for_type(
+        ioc_type,
+        value
+    )
 
     note = normalize_note(item)
 
@@ -793,6 +830,195 @@ def send_ioc(
         "response": response_json,
         "request": payload
     }
+
+
+# ============================================================
+# DEFANG NORMALIZATION (CSV INPUT)
+# ============================================================
+
+def normalize_indicator(value):
+    """
+    Convert defanged IOC indicators to their normal form.
+
+    e.g. "hxxps://evil[.]example.com" -> "https://evil.example.com"
+    """
+
+    if not value:
+        return value
+
+    value = value.strip()
+
+    # Convert defanged protocols.
+    value = value.replace("hxxps://", "https://")
+    value = value.replace("hxxp://", "http://")
+
+    # Convert defanged dots.
+    value = value.replace("[.]", ".")
+
+    return value
+
+
+# ============================================================
+# CSV TO JSON CONVERSION
+# ============================================================
+
+def csv_to_json(input_file, output_file):
+    """
+    Convert an IOC CSV file into the JSON array format consumed by
+    process_ioc_file() / dry_run().
+
+    Required CSV columns:
+        type
+        indicator
+
+    Optional CSV column:
+        description
+
+    Every row's "type" is normalized (see normalize_type()) and its
+    "indicator" is re-fanged and then validated against that type
+    (IP/URL/DOMAIN/SHA1/SHA256 format checks) - a row is written to
+    the output JSON only if it passes. Rows that fail are printed as
+    warnings and skipped rather than being carried into the JSON.
+    """
+
+    data = []
+
+    invalid_count = 0
+    blank_count = 0
+
+    with open(
+        input_file,
+        mode="r",
+        encoding="utf-8-sig",
+        newline=""
+    ) as csv_file:
+
+        # Detect CSV delimiter.
+        sample = csv_file.read(4096)
+        csv_file.seek(0)
+
+        try:
+            dialect = csv.Sniffer().sniff(
+                sample,
+                delimiters=",;|\t"
+            )
+        except csv.Error:
+            dialect = csv.excel
+
+        reader = csv.DictReader(
+            csv_file,
+            dialect=dialect
+        )
+
+        # Clean column names.
+        if reader.fieldnames:
+            reader.fieldnames = [
+                field.strip().lower() if field else field
+                for field in reader.fieldnames
+            ]
+
+        print(
+            "CSV columns found:",
+            reader.fieldnames
+        )
+
+        # Validate required columns.
+        required_columns = {"type", "indicator"}
+
+        if not required_columns.issubset(
+            set(reader.fieldnames or [])
+        ):
+            raise ValueError(
+                f"CSV must contain columns: {required_columns}. "
+                f"Found: {reader.fieldnames}"
+            )
+
+        has_description_column = "description" in (
+            reader.fieldnames or []
+        )
+
+        # Row 1 is the header, so data rows start at 2.
+        for row_number, row in enumerate(reader, start=2):
+
+            raw_type = (row.get("type") or "").strip()
+            raw_indicator = (row.get("indicator") or "").strip()
+
+            # Skip fully empty rows.
+            if not raw_type and not raw_indicator:
+                blank_count += 1
+                continue
+
+            description = ""
+
+            if has_description_column:
+                description = (row.get("description") or "").strip()
+
+            try:
+
+                ioc_type = normalize_type(raw_type)
+
+                indicator = normalize_indicator(raw_indicator)
+
+                # Confirms the value actually looks like the IOC
+                # type it claims to be (a proper IP, URL, domain,
+                # SHA1 or SHA256) before it is written out.
+                value = validate_value_for_type(
+                    ioc_type,
+                    indicator
+                )
+
+            except ValueError as error:
+
+                invalid_count += 1
+
+                print(
+                    f"  [Row {row_number}] SKIPPED - {error} "
+                    f"(type={raw_type!r}, indicator={raw_indicator!r})"
+                )
+
+                continue
+
+            data.append({
+                "type": ioc_type,
+                "value": value,
+                "description": description
+            })
+
+    with open(
+        output_file,
+        mode="w",
+        encoding="utf-8"
+    ) as json_file:
+
+        json.dump(
+            data,
+            json_file,
+            indent=4,
+            ensure_ascii=False
+        )
+
+    print()
+
+    print(
+        f"Converted {len(data)} valid record(s)."
+    )
+
+    if invalid_count:
+        print(
+            f"Skipped {invalid_count} invalid record(s) "
+            "(type/value failed validation)."
+        )
+
+    if blank_count:
+        print(
+            f"Skipped {blank_count} blank row(s)."
+        )
+
+    print(
+        f"JSON saved to: {output_file}"
+    )
+
+    return len(data), invalid_count, blank_count
 
 
 # ============================================================
@@ -1248,14 +1474,15 @@ def show_menu():
         print()
         print("1. Block IOCs from JSON file")
         print("2. Dry-run / validate JSON file")
-        print("3. Show supported IOC types")
-        print("4. Show configuration")
-        print("5. Exit")
+        print("3. Convert CSV to JSON")
+        print("4. Show supported IOC types")
+        print("5. Show configuration")
+        print("6. Exit")
 
         print()
 
         choice = input(
-            "Select option [1-5]: "
+            "Select option [1-6]: "
         ).strip()
 
         # ----------------------------------------------------
@@ -1319,6 +1546,67 @@ def show_menu():
         # ----------------------------------------------------
 
         elif choice == "3":
+
+            input_csv = input(
+                "\nEnter input CSV file: "
+            ).strip()
+
+            if not input_csv:
+
+                print(
+                    "No file specified."
+                )
+
+                continue
+
+            default_output = (
+                os.path.splitext(input_csv)[0]
+                + ".json"
+            )
+
+            output_json = input(
+                f"Enter output JSON file "
+                f"[{default_output}]: "
+            ).strip()
+
+            if not output_json:
+                output_json = default_output
+
+            print()
+            print("=" * 72)
+            print("CSV TO JSON CONVERSION")
+            print("=" * 72)
+
+            print(
+                f"Input file : {input_csv}"
+            )
+
+            print(
+                f"Output file: {output_json}"
+            )
+
+            print()
+
+            try:
+
+                csv_to_json(
+                    input_csv,
+                    output_json
+                )
+
+            except Exception as error:
+
+                print()
+                print(
+                    "ERROR:",
+                    error
+                )
+
+        # ----------------------------------------------------
+        # Option 4
+        # ----------------------------------------------------
+
+        elif choice == "4":
 
             print()
             print(
@@ -1390,10 +1678,10 @@ def show_menu():
             )
 
         # ----------------------------------------------------
-        # Option 4
+        # Option 5
         # ----------------------------------------------------
 
-        elif choice == "4":
+        elif choice == "5":
 
             print()
             print(
@@ -1489,10 +1777,10 @@ def show_menu():
             )
 
         # ----------------------------------------------------
-        # Option 5
+        # Option 6
         # ----------------------------------------------------
 
-        elif choice == "5":
+        elif choice == "6":
 
             print(
                 "\nExiting."
