@@ -22,9 +22,13 @@ Single entry point for the threat-intel workflow:
              skipped. By default this is a fully offline check
              against a local file of UAE CIDR ranges (UAE_CIDR_FILE) -
              no network access or extra packages needed, so it works
-             on an air-gapped machine. A live RDAP/WHOIS lookup mode
-             is also available (GEOIP_METHOD="network") for machines
-             that do have internet access.
+             on an air-gapped machine. Two live-lookup modes are also
+             available for machines with some internet access:
+             GEOIP_METHOD="virustotal" (a plain HTTPS call to the
+             VirusTotal IP report API - the practical choice when
+             only one domain gets whitelisted through a firewall) or
+             GEOIP_METHOD="network" (RDAP/WHOIS against public
+             registries, needs broader internet access).
 
     4. Route the now-valid, non-allowlisted, non-UAE indicator to the
        right tool:
@@ -44,10 +48,11 @@ Single entry point for the threat-intel workflow:
 Requirements:
     pip install requests
 
-    Geo-IP checking needs no extra packages in the default
-    GEOIP_METHOD="offline" mode. Only GEOIP_METHOD="network" (live
-    RDAP/WHOIS lookup, requires internet access - not for an
-    air-gapped machine) optionally benefits from:
+    Geo-IP checking needs no extra packages for either
+    GEOIP_METHOD="offline" (default) or GEOIP_METHOD="virustotal" -
+    both use only "requests", which this tool already depends on.
+    Only GEOIP_METHOD="network" (RDAP/WHOIS against public registries)
+    optionally benefits from:
     pip install ipwhois
 
 Environment variables:
@@ -74,17 +79,25 @@ Environment variables:
         IP_ALLOWLIST_FILE           path to a CSV of IPs/ranges to
                                      never block (see below), unset by
                                      default (no allowlist applied)
-        GEOIP_METHOD                "offline" (default, air-gap safe)
-                                     or "network" (live lookup, needs
-                                     internet access)
+        GEOIP_METHOD                "offline" (default, air-gap safe),
+                                     "virustotal" (HTTPS to one domain,
+                                     www.virustotal.com), or "network"
+                                     (broader RDAP/WHOIS lookup)
         UAE_CIDR_FILE               GEOIP_METHOD="offline" only: path
                                      to a plain-text list of UAE CIDR
                                      ranges (see below), unset by
                                      default (UAE geo-block disabled)
-        GEOIP_LOOKUP_FAILURE_ACTION GEOIP_METHOD="network" only:
-                                     "block" (default) or "skip" - what
-                                     to do with an IP whose country
-                                     could not be determined at all
+        VT_API_KEY                  GEOIP_METHOD="virustotal" only:
+                                     your VirusTotal API key
+        VT_REQUEST_DELAY_SECONDS    GEOIP_METHOD="virustotal" only:
+                                     seconds to sleep before each VT
+                                     call, default 0 - set e.g. 15 on
+                                     VT's 4-requests/minute free tier
+        GEOIP_LOOKUP_FAILURE_ACTION GEOIP_METHOD="network" or
+                                     "virustotal" only: "block"
+                                     (default) or "skip" - what to do
+                                     with an IP whose country could
+                                     not be determined at all
 
 Allowlist CSV format (column names are case-insensitive; one of
 "ip_or_range"/"ip"/"range"/"value" is required):
@@ -199,12 +212,19 @@ UAE_COUNTRY_CODES = {"AE"}
 #   "offline" (default) - match against a local file of known UAE
 #       CIDR ranges (UAE_CIDR_FILE below). No network access and no
 #       extra pip packages required - the only method that works on
-#       an air-gapped machine. If UAE_CIDR_FILE isn't set, this check
-#       is simply skipped (no UAE IPs can be identified).
+#       a fully air-gapped machine. If UAE_CIDR_FILE isn't set, this
+#       check is simply skipped (no UAE IPs can be identified).
+#   "virustotal" - live lookup via the VirusTotal IP report API
+#       (VT_API_KEY below). A single plain HTTPS request to
+#       www.virustotal.com - the practical option when only one
+#       specific domain gets whitelisted through an otherwise
+#       locked-down firewall, since it needs nothing beyond the
+#       "requests" library this tool already depends on (no raw
+#       WHOIS port 43, no extra pip installs).
 #   "network" - live RDAP lookup (pip install ipwhois) with a
 #       fallback to a built-in legacy WHOIS client. Needs outbound
-#       internet access to public registries - do not use this on an
-#       air-gapped machine, it will just time out on every IP.
+#       internet access to public registries on port 43/443 - only
+#       use this where that's actually reachable.
 GEOIP_METHOD = os.environ.get("GEOIP_METHOD", "offline").lower()
 
 # Local file of UAE IP ranges for GEOIP_METHOD="offline": plain text,
@@ -215,9 +235,18 @@ GEOIP_METHOD = os.environ.get("GEOIP_METHOD", "offline").lower()
 # after being carried over via your normal offline transfer process.
 UAE_CIDR_FILE = os.environ.get("UAE_CIDR_FILE", "")
 
-# GEOIP_METHOD="network" only: what to do when the live lookup itself
-# fails (network issue, no ipwhois installed and the WHOIS fallback
-# also failed, etc.):
+# GEOIP_METHOD="virustotal" only.
+VT_API_KEY = os.environ.get("VT_API_KEY", "")
+VT_API_URL = "https://www.virustotal.com/api/v3/ip_addresses/"
+# VirusTotal's free-tier API allows 4 requests/minute. Set this (in
+# seconds) if you're on the free tier and blocking many IPs in one
+# run - e.g. 15 keeps you under the limit. Leave at 0 for a paid tier
+# with a higher/no rate limit.
+VT_REQUEST_DELAY_SECONDS = float(os.environ.get("VT_REQUEST_DELAY_SECONDS", "0"))
+
+# GEOIP_METHOD="network"/"virustotal" only: what to do when the live
+# lookup itself fails (network issue, bad/missing API key, no ipwhois
+# installed and the WHOIS fallback also failed, rate-limited, etc.):
 #   "block" (default) - proceed with the block; we simply couldn't
 #                        confirm the country, which is not evidence
 #                        it's a UAE IP.
@@ -227,7 +256,7 @@ GEOIP_LOOKUP_FAILURE_ACTION = os.environ.get("GEOIP_LOOKUP_FAILURE_ACTION", "blo
 
 GEOIP_TIMEOUT_SECONDS = 10
 
-# Looked up at most once per IP per run (GEOIP_METHOD="network" only).
+# Looked up at most once per IP per run (live-lookup methods only).
 _GEOIP_CACHE = {}
 
 
@@ -280,6 +309,19 @@ def validate_fortigate_configuration():
     if missing:
         raise RuntimeError(
             "Missing FortiGate environment variable(s): " + ", ".join(missing)
+        )
+
+
+def validate_virustotal_configuration():
+    if not VT_API_KEY:
+        raise RuntimeError(
+            "Missing VT_API_KEY environment variable (required for "
+            "GEOIP_METHOD=virustotal). Without it every IP's geo-lookup "
+            f"would fail and, per GEOIP_LOOKUP_FAILURE_ACTION="
+            f"{GEOIP_LOOKUP_FAILURE_ACTION!r}, "
+            + ("every IP would be blocked without ever checking for UAE."
+               if GEOIP_LOOKUP_FAILURE_ACTION != "skip"
+               else "no IP would ever be blocked.")
         )
 
 
@@ -845,18 +887,67 @@ def load_cidr_list_file(filename):
 # IP SAFEGUARDS - GEO-IP (UAE BLOCK)
 # ============================================================
 #
-# Two independent methods, selected by GEOIP_METHOD:
+# Three independent methods, selected by GEOIP_METHOD:
 #
 #   "offline" (default) - is_ip_in_uae_offline() below, a pure
 #       stdlib CIDR-membership check against UAE_CIDR_FILE. No
-#       network access, no extra packages - works air-gapped.
+#       network access, no extra packages - works fully air-gapped.
+#
+#   "virustotal" - _geoip_lookup_virustotal() below, a live HTTPS
+#       lookup against the VirusTotal IP report API. Needs only the
+#       "requests" library this tool already uses and one domain
+#       (www.virustotal.com) reachable - the practical choice when a
+#       firewall whitelists a single URL/tool rather than opening
+#       general internet access.
 #
 #   "network" - _geoip_lookup_rdap()/_geoip_lookup_whois_fallback()
-#       below, a live lookup against public registries. Requires
-#       outbound internet access; not usable air-gapped.
+#       below, a live lookup against public WHOIS/RDAP registries.
+#       Needs broader outbound internet access (and ideally
+#       pip install ipwhois); not usable air-gapped.
 
 def is_ip_in_uae_offline(ip_value, uae_networks):
     return bool(uae_networks) and is_ip_allowlisted(ip_value, uae_networks)
+
+
+def _geoip_lookup_virustotal(ip_value):
+    """
+    Looks up an IP's country via VirusTotal's IP address report:
+        GET https://www.virustotal.com/api/v3/ip_addresses/{ip}
+    Needs only VT_API_KEY and outbound HTTPS to www.virustotal.com -
+    no raw WHOIS port 43, no extra pip packages.
+    """
+    if not VT_API_KEY:
+        return None, "VT_API_KEY not set"
+
+    if VT_REQUEST_DELAY_SECONDS > 0:
+        time.sleep(VT_REQUEST_DELAY_SECONDS)
+
+    try:
+        response = requests.get(
+            VT_API_URL + ip_value,
+            headers={"x-apikey": VT_API_KEY},
+            timeout=GEOIP_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as error:
+        return None, f"VirusTotal lookup failed: {error}"
+
+    if response.status_code == 429:
+        return None, "VirusTotal rate limit hit (HTTP 429) - see VT_REQUEST_DELAY_SECONDS"
+
+    if response.status_code != 200:
+        return None, f"VirusTotal returned HTTP {response.status_code}"
+
+    try:
+        data = response.json()
+    except ValueError:
+        return None, "VirusTotal returned a non-JSON response"
+
+    country = (data.get("data") or {}).get("attributes", {}).get("country")
+
+    if not country:
+        return None, "VirusTotal response did not include a country"
+
+    return country.upper(), None
 
 
 def _geoip_lookup_rdap(ip_value):
@@ -938,20 +1029,25 @@ def _geoip_lookup_whois_fallback(ip_value):
 
 def get_ip_country(ip_value):
     """
-    GEOIP_METHOD="network" only. Returns (country_code, error).
-    country_code is an ISO 3166-1 alpha-2 code (e.g. "AE") or None if
-    it couldn't be determined - error then explains why. Cached so
-    the same IP is never looked up twice in one run.
+    GEOIP_METHOD="network" or "virustotal" only. Returns
+    (country_code, error). country_code is an ISO 3166-1 alpha-2 code
+    (e.g. "AE") or None if it couldn't be determined - error then
+    explains why. Cached so the same IP is never looked up twice in
+    one run (also saves VirusTotal API quota).
     """
-    if ip_value in _GEOIP_CACHE:
-        return _GEOIP_CACHE[ip_value]
+    cache_key = (GEOIP_METHOD, ip_value)
 
-    country, error = _geoip_lookup_rdap(ip_value)
+    if cache_key in _GEOIP_CACHE:
+        return _GEOIP_CACHE[cache_key]
 
-    if country is None:
-        country, error = _geoip_lookup_whois_fallback(ip_value)
+    if GEOIP_METHOD == "virustotal":
+        country, error = _geoip_lookup_virustotal(ip_value)
+    else:
+        country, error = _geoip_lookup_rdap(ip_value)
+        if country is None:
+            country, error = _geoip_lookup_whois_fallback(ip_value)
 
-    _GEOIP_CACHE[ip_value] = (country, error)
+    _GEOIP_CACHE[cache_key] = (country, error)
 
     return country, error
 
@@ -959,9 +1055,9 @@ def get_ip_country(ip_value):
 def determine_uae_status(ip_value, uae_networks):
     """
     Returns (is_uae, country_or_empty, error_or_None), dispatching to
-    the offline CIDR check or the live network lookup per GEOIP_METHOD.
+    the offline CIDR check or a live lookup per GEOIP_METHOD.
     """
-    if GEOIP_METHOD == "network":
+    if GEOIP_METHOD in ("network", "virustotal"):
         country, error = get_ip_country(ip_value)
 
         if country and country in UAE_COUNTRY_CODES:
@@ -990,7 +1086,7 @@ def check_ip_safeguards(ip_value, allowlist_networks, uae_networks):
     if is_uae:
         return False, country, f"IP geolocates to UAE ({country}) - not blocked per policy"
 
-    if GEOIP_METHOD == "network" and not country and error and GEOIP_LOOKUP_FAILURE_ACTION == "skip":
+    if GEOIP_METHOD in ("network", "virustotal") and not country and error and GEOIP_LOOKUP_FAILURE_ACTION == "skip":
         return False, "", f"GeoIP lookup failed ({error}) - skipped per GEOIP_LOOKUP_FAILURE_ACTION=skip"
 
     return True, country, None
@@ -1169,6 +1265,8 @@ def process_file(input_file, dry_run):
             validate_apex_configuration()
         if "FORTIGATE" in needed_targets:
             validate_fortigate_configuration()
+        if GEOIP_METHOD == "virustotal" and "IP" in {(row.get("type") or "").strip().upper() for row in rows}:
+            validate_virustotal_configuration()
 
     allowlist_networks = []
     if IP_ALLOWLIST_FILE:
@@ -1182,6 +1280,8 @@ def process_file(input_file, dry_run):
             print(f"UAE geo-block: offline mode, {len(uae_networks)} range(s) loaded from {UAE_CIDR_FILE}")
         else:
             print("UAE geo-block: disabled (GEOIP_METHOD=offline but UAE_CIDR_FILE is not set)")
+    elif GEOIP_METHOD == "virustotal":
+        print(f"UAE geo-block: VirusTotal mode (lookup failure -> {GEOIP_LOOKUP_FAILURE_ACTION})")
     else:
         print(f"UAE geo-block: network mode (live RDAP/WHOIS lookup, lookup failure -> {GEOIP_LOOKUP_FAILURE_ACTION})")
 
@@ -1294,6 +1394,10 @@ def show_configuration():
     print("GeoIP method:", GEOIP_METHOD)
     if GEOIP_METHOD == "offline":
         print("UAE CIDR file:", UAE_CIDR_FILE or "NOT SET (UAE geo-block disabled)")
+    elif GEOIP_METHOD == "virustotal":
+        print("VT_API_KEY:", "SET" if VT_API_KEY else "NOT SET")
+        print("VT request delay:", f"{VT_REQUEST_DELAY_SECONDS}s")
+        print("On GeoIP lookup failure:", GEOIP_LOOKUP_FAILURE_ACTION)
     else:
         print("On GeoIP lookup failure:", GEOIP_LOOKUP_FAILURE_ACTION)
         try:
