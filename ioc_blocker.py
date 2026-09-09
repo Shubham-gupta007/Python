@@ -11,7 +11,20 @@ Single entry point for the threat-intel workflow:
        missing URL schemes are auto-corrected BEFORE anything is sent
        anywhere. A row that still doesn't look right after fixing is
        never blocked - it's reported as invalid instead.
-    3. Route the now-valid indicator to the right tool:
+    3. Before an IP is actually blocked on FortiGate, two extra
+       safeguards run (IPs only - domains/URLs/hashes are unaffected):
+
+           - Allowlist check: IPs matching an entry in an optional
+             IP_ALLOWLIST_FILE (exact IP, CIDR, or wildcard like
+             "94.*") are skipped, never blocked.
+
+           - Geo-IP check: the IP's country is looked up (RDAP/WHOIS)
+             and an IP that geolocates to the UAE ("AE") is skipped by
+             default - see GEOIP_LOOKUP_FAILURE_ACTION below for what
+             happens when the lookup itself fails.
+
+    4. Route the now-valid, non-allowlisted, non-UAE indicator to the
+       right tool:
 
            IP, DOMAIN              -> FortiGate firewall
                                       (address object + address group)
@@ -19,13 +32,19 @@ Single entry point for the threat-intel workflow:
            URL, SHA1, SHA256       -> Trend Micro Apex Central
                                       (User-Defined Suspicious Object)
 
-    4. Write one results CSV you can open in Excel: original value,
-       auto-corrected value, which tool it went to, and whether it was
-       blocked successfully - so a quick filter tells you exactly what
-       succeeded and what needs a human look.
+    5. Write one results CSV you can open in Excel: original value,
+       auto-corrected value, which tool it went to, the IP's country
+       (when looked up), and whether it was blocked successfully - so
+       a quick filter tells you exactly what succeeded, what was
+       skipped, and what needs a human look.
 
 Requirements:
     pip install requests
+
+    Optional, for the geo-IP check (falls back to a built-in WHOIS
+    client if this isn't installed, but ipwhois is faster/more
+    reliable):
+    pip install ipwhois
 
 Environment variables:
 
@@ -47,6 +66,22 @@ Environment variables:
     IOC types are required - a CSV with only IPs/domains never asks
     for Apex Central credentials, and vice versa.
 
+    IP safeguards (both optional):
+        IP_ALLOWLIST_FILE           path to a CSV of IPs/ranges to
+                                     never block (see below), unset by
+                                     default (no allowlist applied)
+        GEOIP_LOOKUP_FAILURE_ACTION "block" (default) or "skip" - what
+                                     to do with an IP whose country
+                                     could not be determined at all
+
+Allowlist CSV format (column names are case-insensitive; one of
+"ip_or_range"/"ip"/"range"/"value" is required):
+
+    ip_or_range
+    94.*
+    203.0.113.0/24
+    198.51.100.7
+
 Run:
 
     python3 ioc_blocker.py
@@ -65,7 +100,7 @@ Input CSV format (column names are case-insensitive):
 Output: <input file name>_results.csv, with columns:
 
     Row, Type, Original_Value, Fixed_Value, Auto_Fixed, Description,
-    Target_Tool, Status, Detail, Processed_At
+    Target_Tool, Country, Status, Detail, Processed_At
 """
 
 import base64
@@ -76,6 +111,7 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import sys
 import time
 from datetime import datetime, timezone
@@ -123,6 +159,32 @@ FORTIGATE_GROUP_PATH = "/api/v2/cmdb/firewall/addrgrp"
 
 if not APEX_VERIFY_TLS or not FORTIGATE_VERIFY_TLS:
     requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+
+# ============================================================
+# CONFIGURATION - IP SAFEGUARDS (ALLOWLIST + GEO-BLOCK)
+# ============================================================
+
+# Optional CSV of IPs/ranges that must never be blocked, regardless of
+# what the threat intel feed says. Unset by default (no allowlist).
+IP_ALLOWLIST_FILE = os.environ.get("IP_ALLOWLIST_FILE", "")
+
+# ISO 3166-1 alpha-2 country code(s) that an IP is never blocked for.
+UAE_COUNTRY_CODES = {"AE"}
+
+# What to do when the geo-IP lookup itself fails (network issue, no
+# ipwhois installed and the WHOIS fallback also failed, etc.):
+#   "block" (default) - proceed with the block; we simply couldn't
+#                        confirm the country, which is not evidence
+#                        it's a UAE IP.
+#   "skip"             - err on the side of caution and don't block an
+#                         IP whose country is unknown.
+GEOIP_LOOKUP_FAILURE_ACTION = os.environ.get("GEOIP_LOOKUP_FAILURE_ACTION", "block").lower()
+
+GEOIP_TIMEOUT_SECONDS = 10
+
+# Looked up at most once per IP per run.
+_GEOIP_CACHE = {}
 
 
 # ============================================================
@@ -588,6 +650,248 @@ def block_via_fortigate(ioc_type, value, comment):
 
 
 # ============================================================
+# IP SAFEGUARDS - ALLOWLIST
+# ============================================================
+
+def wildcard_to_network(pattern):
+    """
+    Converts a wildcard range into an ip_network. A "*" means "this
+    octet and everything after it is wildcarded" - you don't need to
+    repeat it for every remaining octet:
+
+        "94.*"        -> 94.0.0.0/8
+        "94.10.*"     -> 94.10.0.0/16
+        "94.10.20.*"  -> 94.10.20.0/24
+        "94.*.*.*"    -> 94.0.0.0/8   (equivalent to "94.*")
+
+    Wildcards must trail the concrete octets - "94.*.5.6" is rejected.
+    """
+    octets = pattern.split(".")
+
+    if not 1 <= len(octets) <= 4:
+        raise ValueError(f"Invalid wildcard IP range: {pattern}")
+
+    concrete_octets = []
+    prefix_len = 0
+    seen_wildcard = False
+
+    for octet in octets:
+        if octet == "*":
+            seen_wildcard = True
+            continue
+
+        if seen_wildcard:
+            raise ValueError(
+                f"Invalid wildcard IP range '{pattern}': wildcards must "
+                "trail the concrete octets, e.g. '94.*' or '94.10.*'."
+            )
+
+        if not octet.isdigit() or not 0 <= int(octet) <= 255:
+            raise ValueError(f"Invalid wildcard IP range: {pattern}")
+
+        concrete_octets.append(octet)
+        prefix_len += 8
+
+    if not seen_wildcard:
+        raise ValueError(f"No wildcard '*' found in pattern: {pattern}")
+
+    if not concrete_octets:
+        raise ValueError(
+            f"Invalid wildcard IP range '{pattern}': a bare '*' would "
+            "allowlist every IPv4 address. Give at least one concrete "
+            "octet, e.g. '94.*'."
+        )
+
+    while len(concrete_octets) < 4:
+        concrete_octets.append("0")
+
+    network_str = ".".join(concrete_octets) + f"/{prefix_len}"
+
+    return ipaddress.ip_network(network_str, strict=False)
+
+
+def parse_allowlist_entry(raw_entry):
+    entry = raw_entry.strip()
+
+    if "*" in entry:
+        return wildcard_to_network(entry)
+
+    if "/" in entry:
+        return ipaddress.ip_network(entry, strict=False)
+
+    return ipaddress.ip_network(entry + "/32", strict=False)
+
+
+def load_ip_allowlist(filename):
+    with open(filename, mode="r", encoding="utf-8-sig", newline="") as csv_file:
+        sample = csv_file.read(4096)
+        csv_file.seek(0)
+
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;|\t")
+        except csv.Error:
+            dialect = csv.excel
+
+        reader = csv.DictReader(csv_file, dialect=dialect)
+
+        if reader.fieldnames:
+            reader.fieldnames = [
+                field.strip().lower() if field else field for field in reader.fieldnames
+            ]
+
+        fieldnames = reader.fieldnames or []
+
+        for candidate in ("ip_or_range", "ip", "range", "value"):
+            if candidate in fieldnames:
+                column = candidate
+                break
+        else:
+            raise ValueError(
+                "Allowlist CSV must contain an 'ip_or_range' (or "
+                f"'ip'/'range'/'value') column. Found: {fieldnames}"
+            )
+
+        networks = []
+
+        for row_number, row in enumerate(reader, start=2):
+            raw_entry = (row.get(column) or "").strip()
+
+            if not raw_entry:
+                continue
+
+            try:
+                networks.append(parse_allowlist_entry(raw_entry))
+            except ValueError as error:
+                raise ValueError(f"Allowlist file '{filename}' row {row_number}: {error}")
+
+    return networks
+
+
+def is_ip_allowlisted(ip_value, allowlist_networks):
+    address = ipaddress.ip_address(ip_value)
+    return any(address in network for network in allowlist_networks)
+
+
+# ============================================================
+# IP SAFEGUARDS - GEO-IP (UAE BLOCK)
+# ============================================================
+
+def _geoip_lookup_rdap(ip_value):
+    """
+    Preferred lookup: RDAP, the structured successor to WHOIS, via the
+    ipwhois library. Scraping who.is directly isn't used here - it has
+    no supported API and scraping a website in an automated blocking
+    pipeline is fragile and against most sites' terms of use. RDAP
+    queries the same regional internet registries (ARIN/RIPE/APNIC/
+    LACNIC/AFRINIC) that WHOIS does, with reliable structured output.
+    """
+    try:
+        from ipwhois import IPWhois
+    except ImportError:
+        return None, "ipwhois library not installed (pip install ipwhois)"
+
+    try:
+        result = IPWhois(ip_value).lookup_rdap(depth=0)
+    except Exception as error:
+        return None, f"RDAP lookup failed: {error}"
+
+    country = result.get("asn_country_code")
+
+    if not country:
+        country = (result.get("network") or {}).get("country")
+
+    if not country:
+        return None, "RDAP response did not include a country code"
+
+    return country.upper(), None
+
+
+def _whois_query(server, target, timeout):
+    with socket.create_connection((server, 43), timeout=timeout) as sock:
+        sock.sendall((target + "\r\n").encode("utf-8"))
+        chunks = []
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def _geoip_lookup_whois_fallback(ip_value):
+    """
+    Used only when ipwhois isn't installed: a minimal legacy WHOIS
+    client. Asks IANA who's responsible for this IP, follows the
+    referral to that registry, and reads its "country:" field.
+    """
+    try:
+        iana_response = _whois_query("whois.iana.org", ip_value, GEOIP_TIMEOUT_SECONDS)
+    except OSError as error:
+        return None, f"WHOIS lookup failed: {error}"
+
+    referral_match = re.search(r"(?im)^refer:\s*(\S+)", iana_response)
+
+    if not referral_match:
+        country_match = re.search(r"(?im)^country:\s*(\S+)", iana_response)
+        if country_match:
+            return country_match.group(1).upper(), None
+        return None, "No referral or country field in IANA WHOIS response"
+
+    try:
+        registry_response = _whois_query(referral_match.group(1), ip_value, GEOIP_TIMEOUT_SECONDS)
+    except OSError as error:
+        return None, f"WHOIS lookup failed: {error}"
+
+    country_match = re.search(r"(?im)^country:\s*(\S+)", registry_response)
+
+    if not country_match:
+        return None, "Registry WHOIS response did not include a country field"
+
+    return country_match.group(1).upper(), None
+
+
+def get_ip_country(ip_value):
+    """
+    Returns (country_code, error). country_code is an ISO 3166-1
+    alpha-2 code (e.g. "AE") or None if it couldn't be determined -
+    error then explains why. Cached so the same IP is never looked up
+    twice in one run.
+    """
+    if ip_value in _GEOIP_CACHE:
+        return _GEOIP_CACHE[ip_value]
+
+    country, error = _geoip_lookup_rdap(ip_value)
+
+    if country is None:
+        country, error = _geoip_lookup_whois_fallback(ip_value)
+
+    _GEOIP_CACHE[ip_value] = (country, error)
+
+    return country, error
+
+
+def check_ip_safeguards(ip_value, allowlist_networks):
+    """
+    Runs both IP-only safety gates before a block is allowed to
+    proceed. Returns (allowed, country, skip_reason) - skip_reason is
+    None when allowed is True.
+    """
+    if allowlist_networks and is_ip_allowlisted(ip_value, allowlist_networks):
+        return False, "", "IP is allowlisted - not blocked"
+
+    country, error = get_ip_country(ip_value)
+
+    if country and country in UAE_COUNTRY_CODES:
+        return False, country, f"IP geolocates to UAE ({country}) - not blocked per policy"
+
+    if country is None and GEOIP_LOOKUP_FAILURE_ACTION == "skip":
+        return False, "", f"GeoIP lookup failed ({error}) - skipped per GEOIP_LOOKUP_FAILURE_ACTION=skip"
+
+    return True, (country or ""), None
+
+
+# ============================================================
 # CSV INPUT
 # ============================================================
 
@@ -643,6 +947,7 @@ def process_row(row_number, raw_type, raw_value, description):
         "Auto_Fixed": "No",
         "Description": description,
         "Target_Tool": "",
+        "Country": "",
         "Status": "",
         "Detail": "",
         "Processed_At": "",
@@ -686,6 +991,7 @@ def write_results_csv(output_file, results):
         "Auto_Fixed",
         "Description",
         "Target_Tool",
+        "Country",
         "Status",
         "Detail",
         "Processed_At",
@@ -706,9 +1012,11 @@ def print_summary(results):
     by_status = {}
     by_type = {}
 
+    status_keys = ("Blocked", "Failed", "Invalid", "Skipped", "Would Block")
+
     for row in results:
         by_status[row["Status"]] = by_status.get(row["Status"], 0) + 1
-        by_type.setdefault(row["Type"], {"Blocked": 0, "Failed": 0, "Invalid": 0, "Would Block": 0})
+        by_type.setdefault(row["Type"], {key: 0 for key in status_keys})
         status = row["Status"]
         if status in by_type[row["Type"]]:
             by_type[row["Type"]][status] += 1
@@ -718,11 +1026,14 @@ def print_summary(results):
         print(f"  {status:<12}: {count}")
 
     print()
-    print(f"{'Type':<10} {'Blocked':<10} {'Failed':<10} {'Invalid':<10} {'Would Block':<12}")
+    print(
+        f"{'Type':<10} {'Blocked':<10} {'Failed':<10} {'Invalid':<10} "
+        f"{'Skipped':<10} {'Would Block':<12}"
+    )
     for ioc_type, counts in sorted(by_type.items()):
         print(
             f"{ioc_type:<10} {counts['Blocked']:<10} {counts['Failed']:<10} "
-            f"{counts['Invalid']:<10} {counts['Would Block']:<12}"
+            f"{counts['Invalid']:<10} {counts['Skipped']:<10} {counts['Would Block']:<12}"
         )
 
 
@@ -754,6 +1065,12 @@ def process_file(input_file, dry_run):
         if "FORTIGATE" in needed_targets:
             validate_fortigate_configuration()
 
+    allowlist_networks = []
+    if IP_ALLOWLIST_FILE:
+        allowlist_networks = load_ip_allowlist(IP_ALLOWLIST_FILE)
+        print(f"IP allowlist: {len(allowlist_networks)} entr{'y' if len(allowlist_networks) == 1 else 'ies'} loaded from {IP_ALLOWLIST_FILE}")
+    print(f"UAE geo-block: enabled (lookup failure -> {GEOIP_LOOKUP_FAILURE_ACTION})")
+
     results = []
 
     for row_number, row in enumerate(rows, start=2):
@@ -780,6 +1097,20 @@ def process_file(input_file, dry_run):
 
         if result["Auto_Fixed"] == "Yes":
             print(f"  Auto-fixed: {raw_value!r} -> {fixed_value!r}")
+
+        if ioc_type == "IP":
+            allowed, country, skip_reason = check_ip_safeguards(fixed_value, allowlist_networks)
+            result["Country"] = country
+
+            if not allowed:
+                result["Status"] = "Skipped"
+                result["Detail"] = skip_reason
+                print(f"  SKIPPED - {skip_reason}")
+                results.append(result)
+                continue
+
+            if country:
+                print(f"  Country: {country}")
 
         if dry_run:
             result["Status"] = "Would Block"
@@ -840,6 +1171,18 @@ def show_configuration():
     print("-" * 40)
     print("IP, DOMAIN            -> FortiGate")
     print("URL, SHA1, SHA256     -> Trend Micro Apex Central")
+
+    print()
+    print("IP Safeguards")
+    print("-" * 40)
+    print("Allowlist file:", IP_ALLOWLIST_FILE or "NOT SET (no allowlist applied)")
+    print("Blocked country codes skipped:", ", ".join(sorted(UAE_COUNTRY_CODES)))
+    print("On GeoIP lookup failure:", GEOIP_LOOKUP_FAILURE_ACTION)
+    try:
+        import ipwhois  # noqa: F401
+        print("GeoIP method: ipwhois (RDAP)")
+    except ImportError:
+        print("GeoIP method: built-in WHOIS fallback (pip install ipwhois for RDAP)")
 
 
 def show_menu():
