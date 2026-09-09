@@ -18,10 +18,13 @@ Single entry point for the threat-intel workflow:
              IP_ALLOWLIST_FILE (exact IP, CIDR, or wildcard like
              "94.*") are skipped, never blocked.
 
-           - Geo-IP check: the IP's country is looked up (RDAP/WHOIS)
-             and an IP that geolocates to the UAE ("AE") is skipped by
-             default - see GEOIP_LOOKUP_FAILURE_ACTION below for what
-             happens when the lookup itself fails.
+           - Geo-IP check: an IP that falls in the UAE ("AE") is
+             skipped. By default this is a fully offline check
+             against a local file of UAE CIDR ranges (UAE_CIDR_FILE) -
+             no network access or extra packages needed, so it works
+             on an air-gapped machine. A live RDAP/WHOIS lookup mode
+             is also available (GEOIP_METHOD="network") for machines
+             that do have internet access.
 
     4. Route the now-valid, non-allowlisted, non-UAE indicator to the
        right tool:
@@ -41,9 +44,10 @@ Single entry point for the threat-intel workflow:
 Requirements:
     pip install requests
 
-    Optional, for the geo-IP check (falls back to a built-in WHOIS
-    client if this isn't installed, but ipwhois is faster/more
-    reliable):
+    Geo-IP checking needs no extra packages in the default
+    GEOIP_METHOD="offline" mode. Only GEOIP_METHOD="network" (live
+    RDAP/WHOIS lookup, requires internet access - not for an
+    air-gapped machine) optionally benefits from:
     pip install ipwhois
 
 Environment variables:
@@ -66,11 +70,19 @@ Environment variables:
     IOC types are required - a CSV with only IPs/domains never asks
     for Apex Central credentials, and vice versa.
 
-    IP safeguards (both optional):
+    IP safeguards (all optional):
         IP_ALLOWLIST_FILE           path to a CSV of IPs/ranges to
                                      never block (see below), unset by
                                      default (no allowlist applied)
-        GEOIP_LOOKUP_FAILURE_ACTION "block" (default) or "skip" - what
+        GEOIP_METHOD                "offline" (default, air-gap safe)
+                                     or "network" (live lookup, needs
+                                     internet access)
+        UAE_CIDR_FILE               GEOIP_METHOD="offline" only: path
+                                     to a plain-text list of UAE CIDR
+                                     ranges (see below), unset by
+                                     default (UAE geo-block disabled)
+        GEOIP_LOOKUP_FAILURE_ACTION GEOIP_METHOD="network" only:
+                                     "block" (default) or "skip" - what
                                      to do with an IP whose country
                                      could not be determined at all
 
@@ -81,6 +93,17 @@ Allowlist CSV format (column names are case-insensitive; one of
     94.*
     203.0.113.0/24
     198.51.100.7
+
+UAE_CIDR_FILE format (plain text, one CIDR or IP per line, "#"
+comments and blank lines ignored - the same shape as country zone
+files from sources like ipdeny.com, so one can be dropped in as-is
+after being carried onto the air-gapped machine through your normal
+offline transfer process):
+
+    # Example only - replace with the real UAE CIDR ranges from your
+    # own data source (see note below); these are just illustrative.
+    192.0.2.0/24
+    198.51.100.0/24
 
 Run:
 
@@ -172,8 +195,29 @@ IP_ALLOWLIST_FILE = os.environ.get("IP_ALLOWLIST_FILE", "")
 # ISO 3166-1 alpha-2 country code(s) that an IP is never blocked for.
 UAE_COUNTRY_CODES = {"AE"}
 
-# What to do when the geo-IP lookup itself fails (network issue, no
-# ipwhois installed and the WHOIS fallback also failed, etc.):
+# How to determine an IP's country:
+#   "offline" (default) - match against a local file of known UAE
+#       CIDR ranges (UAE_CIDR_FILE below). No network access and no
+#       extra pip packages required - the only method that works on
+#       an air-gapped machine. If UAE_CIDR_FILE isn't set, this check
+#       is simply skipped (no UAE IPs can be identified).
+#   "network" - live RDAP lookup (pip install ipwhois) with a
+#       fallback to a built-in legacy WHOIS client. Needs outbound
+#       internet access to public registries - do not use this on an
+#       air-gapped machine, it will just time out on every IP.
+GEOIP_METHOD = os.environ.get("GEOIP_METHOD", "offline").lower()
+
+# Local file of UAE IP ranges for GEOIP_METHOD="offline": plain text,
+# one CIDR (or bare IP) per line, blank lines and "#" comments
+# ignored - the same format country zone files from sources like
+# ipdeny.com's country CIDR lists use, so one of those (or an export
+# from your own threat intel/network team) can be dropped in as-is
+# after being carried over via your normal offline transfer process.
+UAE_CIDR_FILE = os.environ.get("UAE_CIDR_FILE", "")
+
+# GEOIP_METHOD="network" only: what to do when the live lookup itself
+# fails (network issue, no ipwhois installed and the WHOIS fallback
+# also failed, etc.):
 #   "block" (default) - proceed with the block; we simply couldn't
 #                        confirm the country, which is not evidence
 #                        it's a UAE IP.
@@ -183,7 +227,7 @@ GEOIP_LOOKUP_FAILURE_ACTION = os.environ.get("GEOIP_LOOKUP_FAILURE_ACTION", "blo
 
 GEOIP_TIMEOUT_SECONDS = 10
 
-# Looked up at most once per IP per run.
+# Looked up at most once per IP per run (GEOIP_METHOD="network" only).
 _GEOIP_CACHE = {}
 
 
@@ -772,18 +816,59 @@ def is_ip_allowlisted(ip_value, allowlist_networks):
     return any(address in network for network in allowlist_networks)
 
 
+def load_cidr_list_file(filename):
+    """
+    Loads a plain-text list of CIDR ranges/IPs, one per line - blank
+    lines and lines starting with "#" are skipped. This is the format
+    used by GEOIP_METHOD="offline" for UAE_CIDR_FILE, and matches
+    country zone files as published by sources like ipdeny.com, so
+    one of those can be used with zero preprocessing.
+    """
+    networks = []
+
+    with open(filename, mode="r", encoding="utf-8-sig") as text_file:
+        for line_number, line in enumerate(text_file, start=1):
+            entry = line.strip()
+
+            if not entry or entry.startswith("#"):
+                continue
+
+            try:
+                networks.append(parse_allowlist_entry(entry))
+            except ValueError as error:
+                raise ValueError(f"{filename} line {line_number}: {error}")
+
+    return networks
+
+
 # ============================================================
 # IP SAFEGUARDS - GEO-IP (UAE BLOCK)
 # ============================================================
+#
+# Two independent methods, selected by GEOIP_METHOD:
+#
+#   "offline" (default) - is_ip_in_uae_offline() below, a pure
+#       stdlib CIDR-membership check against UAE_CIDR_FILE. No
+#       network access, no extra packages - works air-gapped.
+#
+#   "network" - _geoip_lookup_rdap()/_geoip_lookup_whois_fallback()
+#       below, a live lookup against public registries. Requires
+#       outbound internet access; not usable air-gapped.
+
+def is_ip_in_uae_offline(ip_value, uae_networks):
+    return bool(uae_networks) and is_ip_allowlisted(ip_value, uae_networks)
+
 
 def _geoip_lookup_rdap(ip_value):
     """
-    Preferred lookup: RDAP, the structured successor to WHOIS, via the
-    ipwhois library. Scraping who.is directly isn't used here - it has
-    no supported API and scraping a website in an automated blocking
-    pipeline is fragile and against most sites' terms of use. RDAP
-    queries the same regional internet registries (ARIN/RIPE/APNIC/
-    LACNIC/AFRINIC) that WHOIS does, with reliable structured output.
+    RDAP, the structured successor to WHOIS, via the ipwhois library.
+    Scraping who.is directly isn't used here - it has no supported
+    API and scraping a website in an automated blocking pipeline is
+    fragile and against most sites' terms of use. RDAP queries the
+    same regional internet registries (ARIN/RIPE/APNIC/LACNIC/
+    AFRINIC) that WHOIS does, with reliable structured output.
+    Requires outbound internet access - not usable air-gapped, which
+    is why GEOIP_METHOD defaults to "offline" instead.
     """
     try:
         from ipwhois import IPWhois
@@ -853,10 +938,10 @@ def _geoip_lookup_whois_fallback(ip_value):
 
 def get_ip_country(ip_value):
     """
-    Returns (country_code, error). country_code is an ISO 3166-1
-    alpha-2 code (e.g. "AE") or None if it couldn't be determined -
-    error then explains why. Cached so the same IP is never looked up
-    twice in one run.
+    GEOIP_METHOD="network" only. Returns (country_code, error).
+    country_code is an ISO 3166-1 alpha-2 code (e.g. "AE") or None if
+    it couldn't be determined - error then explains why. Cached so
+    the same IP is never looked up twice in one run.
     """
     if ip_value in _GEOIP_CACHE:
         return _GEOIP_CACHE[ip_value]
@@ -871,7 +956,27 @@ def get_ip_country(ip_value):
     return country, error
 
 
-def check_ip_safeguards(ip_value, allowlist_networks):
+def determine_uae_status(ip_value, uae_networks):
+    """
+    Returns (is_uae, country_or_empty, error_or_None), dispatching to
+    the offline CIDR check or the live network lookup per GEOIP_METHOD.
+    """
+    if GEOIP_METHOD == "network":
+        country, error = get_ip_country(ip_value)
+
+        if country and country in UAE_COUNTRY_CODES:
+            return True, country, None
+
+        return False, (country or ""), error
+
+    # "offline" (default) - pure local CIDR match, no network calls.
+    if is_ip_in_uae_offline(ip_value, uae_networks):
+        return True, "AE", None
+
+    return False, "", None
+
+
+def check_ip_safeguards(ip_value, allowlist_networks, uae_networks):
     """
     Runs both IP-only safety gates before a block is allowed to
     proceed. Returns (allowed, country, skip_reason) - skip_reason is
@@ -880,15 +985,15 @@ def check_ip_safeguards(ip_value, allowlist_networks):
     if allowlist_networks and is_ip_allowlisted(ip_value, allowlist_networks):
         return False, "", "IP is allowlisted - not blocked"
 
-    country, error = get_ip_country(ip_value)
+    is_uae, country, error = determine_uae_status(ip_value, uae_networks)
 
-    if country and country in UAE_COUNTRY_CODES:
+    if is_uae:
         return False, country, f"IP geolocates to UAE ({country}) - not blocked per policy"
 
-    if country is None and GEOIP_LOOKUP_FAILURE_ACTION == "skip":
+    if GEOIP_METHOD == "network" and not country and error and GEOIP_LOOKUP_FAILURE_ACTION == "skip":
         return False, "", f"GeoIP lookup failed ({error}) - skipped per GEOIP_LOOKUP_FAILURE_ACTION=skip"
 
-    return True, (country or ""), None
+    return True, country, None
 
 
 # ============================================================
@@ -1069,7 +1174,16 @@ def process_file(input_file, dry_run):
     if IP_ALLOWLIST_FILE:
         allowlist_networks = load_ip_allowlist(IP_ALLOWLIST_FILE)
         print(f"IP allowlist: {len(allowlist_networks)} entr{'y' if len(allowlist_networks) == 1 else 'ies'} loaded from {IP_ALLOWLIST_FILE}")
-    print(f"UAE geo-block: enabled (lookup failure -> {GEOIP_LOOKUP_FAILURE_ACTION})")
+
+    uae_networks = []
+    if GEOIP_METHOD == "offline":
+        if UAE_CIDR_FILE:
+            uae_networks = load_cidr_list_file(UAE_CIDR_FILE)
+            print(f"UAE geo-block: offline mode, {len(uae_networks)} range(s) loaded from {UAE_CIDR_FILE}")
+        else:
+            print("UAE geo-block: disabled (GEOIP_METHOD=offline but UAE_CIDR_FILE is not set)")
+    else:
+        print(f"UAE geo-block: network mode (live RDAP/WHOIS lookup, lookup failure -> {GEOIP_LOOKUP_FAILURE_ACTION})")
 
     results = []
 
@@ -1099,7 +1213,7 @@ def process_file(input_file, dry_run):
             print(f"  Auto-fixed: {raw_value!r} -> {fixed_value!r}")
 
         if ioc_type == "IP":
-            allowed, country, skip_reason = check_ip_safeguards(fixed_value, allowlist_networks)
+            allowed, country, skip_reason = check_ip_safeguards(fixed_value, allowlist_networks, uae_networks)
             result["Country"] = country
 
             if not allowed:
@@ -1177,12 +1291,16 @@ def show_configuration():
     print("-" * 40)
     print("Allowlist file:", IP_ALLOWLIST_FILE or "NOT SET (no allowlist applied)")
     print("Blocked country codes skipped:", ", ".join(sorted(UAE_COUNTRY_CODES)))
-    print("On GeoIP lookup failure:", GEOIP_LOOKUP_FAILURE_ACTION)
-    try:
-        import ipwhois  # noqa: F401
-        print("GeoIP method: ipwhois (RDAP)")
-    except ImportError:
-        print("GeoIP method: built-in WHOIS fallback (pip install ipwhois for RDAP)")
+    print("GeoIP method:", GEOIP_METHOD)
+    if GEOIP_METHOD == "offline":
+        print("UAE CIDR file:", UAE_CIDR_FILE or "NOT SET (UAE geo-block disabled)")
+    else:
+        print("On GeoIP lookup failure:", GEOIP_LOOKUP_FAILURE_ACTION)
+        try:
+            import ipwhois  # noqa: F401
+            print("Network lookup: ipwhois (RDAP)")
+        except ImportError:
+            print("Network lookup: built-in WHOIS fallback (pip install ipwhois for RDAP)")
 
 
 def show_menu():
