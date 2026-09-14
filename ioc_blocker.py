@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Threat Intel IOC Blocker - Trend Micro Apex Central + FortiGate
+Threat Intel IOC Blocker - Trend Micro Apex Central + FortiGate (DC + DR) + Palo Alto
 
 Single entry point for the threat-intel workflow:
 
@@ -30,20 +30,43 @@ Single entry point for the threat-intel workflow:
              GEOIP_METHOD="network" (RDAP/WHOIS against public
              registries, needs broader internet access).
 
-    4. Route the now-valid, non-allowlisted, non-UAE indicator to the
-       right tool:
+    4. Route the now-valid, non-allowlisted, non-UAE indicator to
+       every configured platform that can block its type - an IOC can
+       go to more than one platform, and each attempt gets its own row
+       in the results CSV:
 
-           IP, DOMAIN              -> FortiGate firewall
-                                      (address object + address group)
+           IP        -> FortiGate DC, FortiGate DR, AND Palo Alto
+                         (each independently configured/optional -
+                         only the ones you've actually set up are used)
 
-           URL, SHA1, SHA256       -> Trend Micro Apex Central
-                                      (User-Defined Suspicious Object)
+           DOMAIN    -> FortiGate DC and FortiGate DR
+                         (address object + address group on each site)
+
+           URL, SHA1, SHA256
+                     -> Trend Micro Apex Central
+                        (User-Defined Suspicious Object)
 
     5. Write one results CSV you can open in Excel: original value,
-       auto-corrected value, which tool it went to, the IP's country
-       (when looked up), and whether it was blocked successfully - so
-       a quick filter tells you exactly what succeeded, what was
-       skipped, and what needs a human look.
+       auto-corrected value, which platform it went to, the IP's
+       country (when looked up), and whether it was blocked
+       successfully - so a quick filter tells you exactly what
+       succeeded, what was skipped, and what needs a human look.
+
+Firewall platforms:
+
+    FortiGate DC and FortiGate DR are two independent, optional
+    FortiGate instances - configure either, both, or neither (per IOC
+    type; DOMAIN needs at least one FortiGate site). Each site has its
+    own host/key/vdom/groups, and IPs/domains are blocked on every
+    site that's configured, not just one - the point is both your
+    primary and DR firewalls end up with the same block, not just
+    whichever one you happened to configure.
+
+    Palo Alto blocks IPs only (this tool doesn't send domains there).
+    Address/address-group changes are staged during the run and
+    committed once at the end (PAN-OS requires an explicit commit for
+    config changes to take effect - committing after every single IP
+    would be far too slow for a bulk run).
 
 Requirements:
     pip install requests
@@ -63,17 +86,36 @@ Environment variables:
         APEX_API_KEY
         APEX_VERIFY_TLS          optional, "true"/"false", default "false"
 
-    FortiGate:
-        FORTIGATE_HOST           e.g. "https://192.168.1.1:443"
-        FORTIGATE_API_KEY
-        FORTIGATE_VDOM           optional, default "root"
-        FORTIGATE_IP_GROUP       optional, default "Blocked-IPs"
-        FORTIGATE_DOMAIN_GROUP   optional, default "Blocked-Domains"
-        FORTIGATE_VERIFY_TLS     optional, "true"/"false", default "false"
+    FortiGate DC and FortiGate DR (each optional/independent - set the
+    ones you have; at least one of the two is required if the CSV
+    contains any IP/DOMAIN rows):
+        FORTIGATE_DC_HOST            e.g. "https://192.168.1.1:443"
+        FORTIGATE_DC_API_KEY
+        FORTIGATE_DC_VDOM            optional, default "root"
+        FORTIGATE_DC_IP_GROUP        optional, default "Blocked-IPs"
+        FORTIGATE_DC_DOMAIN_GROUP    optional, default "Blocked-Domains"
+        FORTIGATE_DC_VERIFY_TLS      optional, "true"/"false", default "false"
 
-    Only the variables for the tool(s) actually needed by the CSV's
-    IOC types are required - a CSV with only IPs/domains never asks
-    for Apex Central credentials, and vice versa.
+        FORTIGATE_DR_HOST            same shape as DC, for the DR site
+        FORTIGATE_DR_API_KEY
+        FORTIGATE_DR_VDOM
+        FORTIGATE_DR_IP_GROUP
+        FORTIGATE_DR_DOMAIN_GROUP
+        FORTIGATE_DR_VERIFY_TLS
+
+    Palo Alto (optional; IP blocking only):
+        PALOALTO_HOST            e.g. "https://192.168.1.1"
+        PALOALTO_API_KEY         a pre-generated PAN-OS API key
+        PALOALTO_VSYS            optional, default "vsys1"
+        PALOALTO_IP_GROUP        optional, default "Blocked-IPs"
+        PALOALTO_VERIFY_TLS      optional, "true"/"false", default "false"
+
+    Only the variables for the platform(s) actually needed by the
+    CSV's IOC types are required - a CSV with only URL/hash rows never
+    asks for firewall credentials, and vice versa. For IP/DOMAIN rows,
+    at least one applicable platform (any combination of FortiGate
+    DC/DR, plus Palo Alto for IPs) must be configured, or the run
+    refuses to start with a clear error naming what's missing.
 
     IP safeguards (all optional):
         IP_ALLOWLIST_FILE           path to a CSV of IPs/ranges to
@@ -150,8 +192,10 @@ import re
 import socket
 import sys
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+from xml.sax.saxutils import escape as xml_escape
 
 import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -180,20 +224,67 @@ APEX_TYPE_MAP = {
 
 
 # ============================================================
-# CONFIGURATION - FORTIGATE
+# CONFIGURATION - FORTIGATE (DC + DR)
 # ============================================================
-
-FORTIGATE_HOST = os.environ.get("FORTIGATE_HOST", "")
-FORTIGATE_API_KEY = os.environ.get("FORTIGATE_API_KEY", "")
-FORTIGATE_VDOM = os.environ.get("FORTIGATE_VDOM", "root")
-FORTIGATE_IP_GROUP = os.environ.get("FORTIGATE_IP_GROUP", "Blocked-IPs")
-FORTIGATE_DOMAIN_GROUP = os.environ.get("FORTIGATE_DOMAIN_GROUP", "Blocked-Domains")
-FORTIGATE_VERIFY_TLS = os.environ.get("FORTIGATE_VERIFY_TLS", "false").lower() == "true"
+#
+# Two independent, optional FortiGate sites. An IP/DOMAIN is blocked
+# on every site that's configured (not just one) - see
+# fortigate_targets_configured() and block_via_fortigate() below.
 
 FORTIGATE_ADDRESS_PATH = "/api/v2/cmdb/firewall/address"
 FORTIGATE_GROUP_PATH = "/api/v2/cmdb/firewall/addrgrp"
 
-if not APEX_VERIFY_TLS or not FORTIGATE_VERIFY_TLS:
+
+def _load_fortigate_site(prefix):
+    return {
+        "host": os.environ.get(f"FORTIGATE_{prefix}_HOST", ""),
+        "api_key": os.environ.get(f"FORTIGATE_{prefix}_API_KEY", ""),
+        "vdom": os.environ.get(f"FORTIGATE_{prefix}_VDOM", "root"),
+        "ip_group": os.environ.get(f"FORTIGATE_{prefix}_IP_GROUP", "Blocked-IPs"),
+        "domain_group": os.environ.get(f"FORTIGATE_{prefix}_DOMAIN_GROUP", "Blocked-Domains"),
+        "verify_tls": os.environ.get(f"FORTIGATE_{prefix}_VERIFY_TLS", "false").lower() == "true",
+    }
+
+
+FORTIGATE_SITES = {
+    "DC": _load_fortigate_site("DC"),
+    "DR": _load_fortigate_site("DR"),
+}
+
+
+def fortigate_site_configured(site_name):
+    site = FORTIGATE_SITES[site_name]
+    return bool(site["host"] and site["api_key"])
+
+
+# ============================================================
+# CONFIGURATION - PALO ALTO (IP BLOCKING ONLY)
+# ============================================================
+
+PALOALTO_HOST = os.environ.get("PALOALTO_HOST", "")
+PALOALTO_API_KEY = os.environ.get("PALOALTO_API_KEY", "")
+PALOALTO_VSYS = os.environ.get("PALOALTO_VSYS", "vsys1")
+PALOALTO_IP_GROUP = os.environ.get("PALOALTO_IP_GROUP", "Blocked-IPs")
+PALOALTO_VERIFY_TLS = os.environ.get("PALOALTO_VERIFY_TLS", "false").lower() == "true"
+
+PALOALTO_API_PATH = "/api/"
+PALOALTO_BASE_XPATH = (
+    "/config/devices/entry[@name='localhost.localdomain']"
+    f"/vsys/entry[@name='{PALOALTO_VSYS}']"
+)
+PALOALTO_ADDRESS_XPATH = PALOALTO_BASE_XPATH + "/address/entry[@name='{name}']"
+PALOALTO_GROUP_STATIC_XPATH = PALOALTO_BASE_XPATH + "/address-group/entry[@name='{group}']/static"
+
+
+def paloalto_configured():
+    return bool(PALOALTO_HOST and PALOALTO_API_KEY)
+
+
+if (
+    not APEX_VERIFY_TLS
+    or any(not site["verify_tls"] for site in FORTIGATE_SITES.values())
+    or not PALOALTO_VERIFY_TLS
+):
     requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 
@@ -261,24 +352,45 @@ _GEOIP_CACHE = {}
 
 
 # ============================================================
-# ROUTING - WHICH TOOL HANDLES WHICH IOC TYPE
+# ROUTING - WHICH PLATFORM(S) HANDLE WHICH IOC TYPE
 # ============================================================
+#
+# An IOC type can route to more than one platform - e.g. an IP goes to
+# FortiGate DC, FortiGate DR, AND Palo Alto, whichever of those are
+# actually configured. Each attempt gets its own row in the results
+# CSV (see process_file()).
 
-ROUTE_TO_FORTIGATE = {"IP", "DOMAIN"}
-ROUTE_TO_APEX = {"URL", "SHA1", "SHA256"}
+BASE_ROUTES = {
+    "IP": ["FORTIGATE_DC", "FORTIGATE_DR", "PALOALTO"],
+    "DOMAIN": ["FORTIGATE_DC", "FORTIGATE_DR"],
+    "URL": ["APEX"],
+    "SHA1": ["APEX"],
+    "SHA256": ["APEX"],
+}
+
+ROUTE_TO_APEX = {ioc_type for ioc_type, targets in BASE_ROUTES.items() if "APEX" in targets}
 
 TARGET_LABEL = {
-    "FORTIGATE": "FortiGate",
+    "FORTIGATE_DC": "FortiGate-DC",
+    "FORTIGATE_DR": "FortiGate-DR",
+    "PALOALTO": "Palo Alto",
     "APEX": "Trend Micro Apex Central",
 }
 
 
-def target_for_type(ioc_type):
-    if ioc_type in ROUTE_TO_FORTIGATE:
-        return "FORTIGATE"
-    if ioc_type in ROUTE_TO_APEX:
-        return "APEX"
-    return None
+def is_target_configured(target_key):
+    if target_key in ("FORTIGATE_DC", "FORTIGATE_DR"):
+        return fortigate_site_configured(target_key.split("_")[1])
+    if target_key == "PALOALTO":
+        return paloalto_configured()
+    if target_key == "APEX":
+        return bool(APEX_CENTRAL_URL and APEX_APPLICATION_ID and APEX_API_KEY)
+    return False
+
+
+def targets_for_type(ioc_type):
+    """Configured platforms only - what a real run will actually use."""
+    return [target for target in BASE_ROUTES.get(ioc_type, []) if is_target_configured(target)]
 
 
 def validate_apex_configuration():
@@ -297,19 +409,59 @@ def validate_apex_configuration():
         )
 
 
-def validate_fortigate_configuration():
+def validate_fortigate_site_configuration(site_name):
+    site = FORTIGATE_SITES[site_name]
+
+    # Not configured at all is fine - it just means this site is unused.
+    if not site["host"] and not site["api_key"]:
+        return
+
     missing = [
         name
         for name, value in (
-            ("FORTIGATE_HOST", FORTIGATE_HOST),
-            ("FORTIGATE_API_KEY", FORTIGATE_API_KEY),
+            (f"FORTIGATE_{site_name}_HOST", site["host"]),
+            (f"FORTIGATE_{site_name}_API_KEY", site["api_key"]),
         )
         if not value
     ]
     if missing:
         raise RuntimeError(
-            "Missing FortiGate environment variable(s): " + ", ".join(missing)
+            f"Missing FortiGate {site_name} environment variable(s): " + ", ".join(missing)
         )
+
+
+def validate_paloalto_configuration():
+    # Not configured at all is fine - Palo Alto is optional.
+    if not PALOALTO_HOST and not PALOALTO_API_KEY:
+        return
+
+    missing = [
+        name
+        for name, value in (
+            ("PALOALTO_HOST", PALOALTO_HOST),
+            ("PALOALTO_API_KEY", PALOALTO_API_KEY),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            "Missing Palo Alto environment variable(s): " + ", ".join(missing)
+        )
+
+
+def validate_platform_coverage(present_types):
+    """
+    For every IOC type actually present in the file, make sure at
+    least one applicable platform is configured - otherwise the file
+    would silently have nothing to send those rows to.
+    """
+    for ioc_type in present_types:
+        if ioc_type in BASE_ROUTES and not targets_for_type(ioc_type):
+            candidates = ", ".join(TARGET_LABEL[t] for t in BASE_ROUTES[ioc_type])
+            raise RuntimeError(
+                f"No configured platform can block IOC type '{ioc_type}'. "
+                f"Configure at least one of: {candidates}."
+            )
 
 
 def validate_virustotal_configuration():
@@ -351,9 +503,9 @@ def normalize_type(value):
 
     if key not in TYPE_ALIASES:
         raise ValueError(
-            f"Unsupported IOC type '{value}'. Supported: IP, DOMAIN "
-            "(blocked on FortiGate), URL, SHA1, SHA256 (blocked on "
-            "Trend Micro Apex Central)."
+            f"Unsupported IOC type '{value}'. Supported: IP (FortiGate "
+            "DC/DR, Palo Alto), DOMAIN (FortiGate DC/DR), URL, SHA1, "
+            "SHA256 (Trend Micro Apex Central)."
         )
 
     return TYPE_ALIASES[key]
@@ -606,12 +758,15 @@ def block_via_apex(ioc_type, value, note):
 
 
 # ============================================================
-# FORTIGATE - BLOCK
+# FORTIGATE - BLOCK (DC + DR)
 # ============================================================
+# Every function here takes the target site's config dict (one of
+# FORTIGATE_SITES["DC"]/["DR"]) so the exact same code blocks either
+# site - block_via_fortigate(site_name, ...) below is the entry point.
 
-def fortigate_api_headers():
+def fortigate_api_headers(site):
     return {
-        "Authorization": f"Bearer {FORTIGATE_API_KEY}",
+        "Authorization": f"Bearer {site['api_key']}",
         "Content-Type": "application/json",
     }
 
@@ -645,16 +800,16 @@ def fortigate_is_duplicate(response):
         return False
 
 
-def fortigate_create_or_update_address(payload):
+def fortigate_create_or_update_address(site, payload):
     name = payload["name"]
-    url = f"{FORTIGATE_HOST}{FORTIGATE_ADDRESS_PATH}"
+    url = f"{site['host']}{FORTIGATE_ADDRESS_PATH}"
 
     response = requests.post(
         url,
-        headers=fortigate_api_headers(),
-        params={"vdom": FORTIGATE_VDOM},
+        headers=fortigate_api_headers(site),
+        params={"vdom": site["vdom"]},
         json=payload,
-        verify=FORTIGATE_VERIFY_TLS,
+        verify=site["verify_tls"],
         timeout=30,
     )
 
@@ -664,10 +819,10 @@ def fortigate_create_or_update_address(payload):
     if response.status_code == 500 and fortigate_is_duplicate(response):
         response = requests.put(
             f"{url}/{name}",
-            headers=fortigate_api_headers(),
-            params={"vdom": FORTIGATE_VDOM},
+            headers=fortigate_api_headers(site),
+            params={"vdom": site["vdom"]},
             json=payload,
-            verify=FORTIGATE_VERIFY_TLS,
+            verify=site["verify_tls"],
             timeout=30,
         )
         return response.status_code == 200, response
@@ -675,14 +830,14 @@ def fortigate_create_or_update_address(payload):
     return False, response
 
 
-def fortigate_add_to_group(group_name, member_name):
-    url = f"{FORTIGATE_HOST}{FORTIGATE_GROUP_PATH}/{group_name}"
+def fortigate_add_to_group(site, group_name, member_name):
+    url = f"{site['host']}{FORTIGATE_GROUP_PATH}/{group_name}"
 
     response = requests.get(
         url,
-        headers=fortigate_api_headers(),
-        params={"vdom": FORTIGATE_VDOM},
-        verify=FORTIGATE_VERIFY_TLS,
+        headers=fortigate_api_headers(site),
+        params={"vdom": site["vdom"]},
+        verify=site["verify_tls"],
         timeout=30,
     )
 
@@ -700,10 +855,10 @@ def fortigate_add_to_group(group_name, member_name):
 
     response = requests.put(
         url,
-        headers=fortigate_api_headers(),
-        params={"vdom": FORTIGATE_VDOM},
+        headers=fortigate_api_headers(site),
+        params={"vdom": site["vdom"]},
         json=payload,
-        verify=FORTIGATE_VERIFY_TLS,
+        verify=site["verify_tls"],
         timeout=30,
     )
 
@@ -713,26 +868,195 @@ def fortigate_add_to_group(group_name, member_name):
     return False, f"HTTP {response.status_code} - could not update group '{group_name}'"
 
 
-def block_via_fortigate(ioc_type, value, comment):
-    """Returns (success, detail_text)."""
+def block_via_fortigate(site_name, ioc_type, value, comment):
+    """Returns (success, detail_text). site_name is "DC" or "DR"."""
+    site = FORTIGATE_SITES[site_name]
     payload = build_fortigate_payload(ioc_type, value, comment)
 
-    success, response = fortigate_create_or_update_address(payload)
+    success, response = fortigate_create_or_update_address(site, payload)
 
     if not success:
         try:
             body = response.json()
         except ValueError:
             body = response.text
-        return False, f"HTTP {response.status_code} - address object failed: {body}"
+        return False, f"[{site_name}] HTTP {response.status_code} - address object failed: {body}"
 
-    group = FORTIGATE_IP_GROUP if ioc_type == "IP" else FORTIGATE_DOMAIN_GROUP
-    group_success, group_detail = fortigate_add_to_group(group, value)
+    group = site["ip_group"] if ioc_type == "IP" else site["domain_group"]
+    group_success, group_detail = fortigate_add_to_group(site, group, value)
 
     address_type = "ipmask" if ioc_type == "IP" else "fqdn"
-    detail = f"HTTP {response.status_code} - {address_type} address created/updated, {group_detail}"
+    detail = f"[{site_name}] HTTP {response.status_code} - {address_type} address created/updated, {group_detail}"
 
     return group_success, detail
+
+
+# ============================================================
+# PALO ALTO - BLOCK (IP ONLY)
+# ============================================================
+# Uses the PAN-OS XML API (type=config, action=set/get) rather than
+# the newer REST API for maximum compatibility across PAN-OS versions.
+# Config changes are staged, not applied immediately - a single
+# commit_paloalto_changes() call at the end of the run (see
+# process_file()) pushes everything made during the run in one shot,
+# since committing after every IP would be far too slow in bulk.
+
+_paloalto_pending_commit = False
+
+
+def paloalto_request(params):
+    return requests.get(
+        f"{PALOALTO_HOST}{PALOALTO_API_PATH}",
+        params=params,
+        verify=PALOALTO_VERIFY_TLS,
+        timeout=30,
+    )
+
+
+def paloalto_parse_status(response):
+    """Returns (success, error_message_or_None)."""
+    try:
+        root = ET.fromstring(response.text)
+    except ET.ParseError:
+        return False, f"HTTP {response.status_code} - non-XML response from Palo Alto"
+
+    if root.get("status") == "success":
+        return True, None
+
+    message = root.findtext(".//msg") or root.findtext(".//line") or response.text[:200]
+    return False, f"HTTP {response.status_code} - {message}"
+
+
+def build_paloalto_address_element(ip_value, comment):
+    element = f"<ip-netmask>{ip_value}/32</ip-netmask>"
+
+    if comment:
+        element += f"<description>{xml_escape(comment)}</description>"
+
+    return element
+
+
+def paloalto_set_address_object(name, ip_value, comment):
+    response = paloalto_request({
+        "type": "config",
+        "action": "set",
+        "key": PALOALTO_API_KEY,
+        "xpath": PALOALTO_ADDRESS_XPATH.format(name=name),
+        "element": build_paloalto_address_element(ip_value, comment),
+    })
+
+    success, error = paloalto_parse_status(response)
+
+    return success, error, response
+
+
+def paloalto_get_group_members(group_name):
+    response = paloalto_request({
+        "type": "config",
+        "action": "get",
+        "key": PALOALTO_API_KEY,
+        "xpath": PALOALTO_GROUP_STATIC_XPATH.format(group=group_name),
+    })
+
+    try:
+        root = ET.fromstring(response.text)
+    except ET.ParseError:
+        return None, f"HTTP {response.status_code} - non-XML response from Palo Alto"
+
+    if root.get("status") != "success":
+        message = root.findtext(".//msg") or response.text[:200]
+        return None, f"could not read group '{group_name}' (does it exist?): {message}"
+
+    members = [member.text for member in root.findall(".//member") if member.text]
+
+    return members, None
+
+
+def paloalto_set_group_members(group_name, members):
+    element = "<static>" + "".join(f"<member>{xml_escape(m)}</member>" for m in members) + "</static>"
+
+    response = paloalto_request({
+        "type": "config",
+        "action": "set",
+        "key": PALOALTO_API_KEY,
+        "xpath": PALOALTO_GROUP_STATIC_XPATH.format(group=group_name),
+        "element": element,
+    })
+
+    return paloalto_parse_status(response)
+
+
+def block_via_paloalto(ioc_type, value, comment):
+    """Returns (success, detail_text). IP only - see BASE_ROUTES."""
+    global _paloalto_pending_commit
+
+    if ioc_type != "IP":
+        return False, f"Palo Alto blocking here only supports IP, got {ioc_type}"
+
+    success, error, response = paloalto_set_address_object(value, value, comment)
+
+    if not success:
+        return False, f"HTTP {response.status_code} - address object failed: {error}"
+
+    members, get_error = paloalto_get_group_members(PALOALTO_IP_GROUP)
+
+    if members is None:
+        return False, f"HTTP {response.status_code} - address object ok, {get_error}"
+
+    if value in members:
+        detail = f"HTTP {response.status_code} - address object created/updated, already a member of group '{PALOALTO_IP_GROUP}'"
+    else:
+        group_success, group_error = paloalto_set_group_members(PALOALTO_IP_GROUP, members + [value])
+
+        if not group_success:
+            return False, f"HTTP {response.status_code} - address object ok, group update failed: {group_error}"
+
+        detail = f"HTTP {response.status_code} - address object created/updated, added to group '{PALOALTO_IP_GROUP}'"
+
+    _paloalto_pending_commit = True
+
+    return True, detail + " (staged, pending commit)"
+
+
+def commit_paloalto_changes():
+    """
+    Call once after processing the whole file. Returns None if nothing
+    was staged (no commit needed), otherwise (success, detail_text).
+    """
+    global _paloalto_pending_commit
+
+    if not _paloalto_pending_commit:
+        return None
+
+    response = paloalto_request({
+        "type": "commit",
+        "cmd": "<commit></commit>",
+        "key": PALOALTO_API_KEY,
+    })
+
+    success, error = paloalto_parse_status(response)
+
+    _paloalto_pending_commit = False
+
+    if not success:
+        return False, f"commit failed: {error}"
+
+    job_id = None
+    try:
+        job_id = ET.fromstring(response.text).findtext(".//job")
+    except ET.ParseError:
+        pass
+
+    return True, f"commit job enqueued{f' (job id {job_id})' if job_id else ''}"
+
+
+# Every entry takes (ioc_type, value, comment) and returns (success, detail).
+BLOCK_FUNCTIONS = {
+    "FORTIGATE_DC": lambda ioc_type, value, comment: block_via_fortigate("DC", ioc_type, value, comment),
+    "FORTIGATE_DR": lambda ioc_type, value, comment: block_via_fortigate("DR", ioc_type, value, comment),
+    "PALOALTO": lambda ioc_type, value, comment: block_via_paloalto(ioc_type, value, comment),
+    "APEX": lambda ioc_type, value, comment: block_via_apex(ioc_type, value, comment),
+}
 
 
 # ============================================================
@@ -1136,9 +1460,10 @@ def load_csv_rows(input_file):
 
 def process_row(row_number, raw_type, raw_value, description):
     """
-    Validates/auto-fixes one row and returns a result dict ready for
-    the results CSV, plus (ioc_type, fixed_value, target) to block -
-    or None as the second item if the row can't be blocked at all.
+    Validates/auto-fixes one row and returns a base result dict (no
+    Target_Tool/Status/Detail yet - process_file() clones this once
+    per platform the IOC routes to) plus (ioc_type, fixed_value) - or
+    None as the second item if the row can't be blocked at all.
     """
     result = {
         "Row": row_number,
@@ -1173,10 +1498,7 @@ def process_row(row_number, raw_type, raw_value, description):
     result["Fixed_Value"] = fixed_value
     result["Auto_Fixed"] = "Yes" if was_fixed else "No"
 
-    target = target_for_type(ioc_type)
-    result["Target_Tool"] = TARGET_LABEL[target]
-
-    return result, (ioc_type, fixed_value, target)
+    return result, (ioc_type, fixed_value)
 
 
 # ============================================================
@@ -1248,24 +1570,26 @@ def process_file(input_file, dry_run):
     print(f"Input file : {input_file}")
     print(f"Row count  : {len(rows)}")
 
-    # Pre-scan: which tool(s) will actually be needed, so we only ask
+    # Pre-scan: which IOC types are actually present, so we only ask
     # for credentials the CSV's IOC types actually require.
-    needed_targets = set()
+    present_types = set()
     for row in rows:
         try:
-            ioc_type = normalize_type(row.get("type", ""))
-            target = target_for_type(ioc_type)
-            if target:
-                needed_targets.add(target)
+            present_types.add(normalize_type(row.get("type", "")))
         except ValueError:
             continue
 
     if not dry_run:
-        if "APEX" in needed_targets:
+        validate_fortigate_site_configuration("DC")
+        validate_fortigate_site_configuration("DR")
+        validate_paloalto_configuration()
+
+        if present_types & ROUTE_TO_APEX:
             validate_apex_configuration()
-        if "FORTIGATE" in needed_targets:
-            validate_fortigate_configuration()
-        if GEOIP_METHOD == "virustotal" and "IP" in {(row.get("type") or "").strip().upper() for row in rows}:
+
+        validate_platform_coverage(present_types)
+
+        if GEOIP_METHOD == "virustotal" and "IP" in present_types:
             validate_virustotal_configuration()
 
     allowlist_networks = []
@@ -1299,52 +1623,81 @@ def process_file(input_file, dry_run):
         print("-" * 72)
         print(f"[Row {row_number}] type={raw_type!r} value={raw_value!r}")
 
-        result, route = process_row(row_number, raw_type, raw_value, description)
-        result["Processed_At"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        base_result, route = process_row(row_number, raw_type, raw_value, description)
+        base_result["Processed_At"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         if route is None:
-            print(f"  INVALID - {result['Detail']}")
-            results.append(result)
+            print(f"  INVALID - {base_result['Detail']}")
+            results.append(base_result)
             continue
 
-        ioc_type, fixed_value, target = route
+        ioc_type, fixed_value = route
 
-        if result["Auto_Fixed"] == "Yes":
+        if base_result["Auto_Fixed"] == "Yes":
             print(f"  Auto-fixed: {raw_value!r} -> {fixed_value!r}")
 
         if ioc_type == "IP":
             allowed, country, skip_reason = check_ip_safeguards(fixed_value, allowlist_networks, uae_networks)
-            result["Country"] = country
+            base_result["Country"] = country
 
             if not allowed:
-                result["Status"] = "Skipped"
-                result["Detail"] = skip_reason
+                base_result["Status"] = "Skipped"
+                base_result["Detail"] = skip_reason
                 print(f"  SKIPPED - {skip_reason}")
-                results.append(result)
+                results.append(base_result)
                 continue
 
             if country:
                 print(f"  Country: {country}")
 
-        if dry_run:
-            result["Status"] = "Would Block"
-            result["Detail"] = f"Would send to {result['Target_Tool']}"
-            print(f"  {result['Detail']}")
-            results.append(result)
+        # An IOC type can route to more than one platform (e.g. an IP
+        # goes to FortiGate DC, FortiGate DR, and Palo Alto) - each
+        # attempt below gets its own row in the results CSV. In dry
+        # run, show every platform the type *could* go to, even ones
+        # not currently configured, so the preview is complete.
+        targets = BASE_ROUTES.get(ioc_type, []) if dry_run else targets_for_type(ioc_type)
+
+        if not targets:
+            row = dict(base_result)
+            row["Status"] = "Failed"
+            row["Detail"] = f"No configured platform for type {ioc_type}"
+            print(f"  FAILED - {row['Detail']}")
+            results.append(row)
             continue
 
-        if target == "APEX":
-            note = description or DEFAULT_NOTE
-            success, detail = block_via_apex(ioc_type, fixed_value, note)
-        else:
-            success, detail = block_via_fortigate(ioc_type, fixed_value, description)
+        for target in targets:
+            row = dict(base_result)
+            row["Target_Tool"] = TARGET_LABEL[target]
 
-        result["Status"] = "Blocked" if success else "Failed"
-        result["Detail"] = detail
+            if dry_run:
+                row["Status"] = "Would Block"
+                row["Detail"] = f"Would send to {row['Target_Tool']}"
+                print(f"  {row['Detail']}")
+                results.append(row)
+                continue
 
-        print(f"  [{'BLOCKED' if success else 'FAILED'}] {detail}")
+            comment = (description or DEFAULT_NOTE) if target == "APEX" else description
+            success, detail = BLOCK_FUNCTIONS[target](ioc_type, fixed_value, comment)
 
-        results.append(result)
+            row["Status"] = "Blocked" if success else "Failed"
+            row["Detail"] = detail
+
+            print(f"  [{row['Target_Tool']}] [{'BLOCKED' if success else 'FAILED'}] {detail}")
+
+            results.append(row)
+
+    if not dry_run:
+        commit_result = commit_paloalto_changes()
+        if commit_result is not None:
+            commit_success, commit_detail = commit_result
+            print()
+            print("=" * 72)
+            print("PALO ALTO COMMIT")
+            print("=" * 72)
+            print(("SUCCESS - " if commit_success else "FAILED - ") + commit_detail)
+            if not commit_success:
+                print("WARNING: Palo Alto address/group changes were staged but NOT")
+                print("committed - review and commit manually via the Palo Alto UI/CLI.")
 
     output_file = os.path.splitext(input_file)[0] + "_results.csv"
     write_results_csv(output_file, results)
@@ -1370,20 +1723,34 @@ def show_configuration():
     print("API Key:", "SET" if APEX_API_KEY else "NOT SET")
     print("TLS verification:", APEX_VERIFY_TLS)
 
+    for site_name in ("DC", "DR"):
+        site = FORTIGATE_SITES[site_name]
+        print()
+        print(f"FortiGate {site_name}")
+        print("-" * 40)
+        print("Host:", site["host"] or "NOT SET")
+        print("API Key:", "SET" if site["api_key"] else "NOT SET")
+        print("VDOM:", site["vdom"])
+        print("IP block group:", site["ip_group"])
+        print("Domain block group:", site["domain_group"])
+        print("TLS verification:", site["verify_tls"])
+        print("Configured:", fortigate_site_configured(site_name))
+
     print()
-    print("FortiGate")
+    print("Palo Alto")
     print("-" * 40)
-    print("Host:", FORTIGATE_HOST or "NOT SET")
-    print("API Key:", "SET" if FORTIGATE_API_KEY else "NOT SET")
-    print("VDOM:", FORTIGATE_VDOM)
-    print("IP block group:", FORTIGATE_IP_GROUP)
-    print("Domain block group:", FORTIGATE_DOMAIN_GROUP)
-    print("TLS verification:", FORTIGATE_VERIFY_TLS)
+    print("Host:", PALOALTO_HOST or "NOT SET")
+    print("API Key:", "SET" if PALOALTO_API_KEY else "NOT SET")
+    print("Vsys:", PALOALTO_VSYS)
+    print("IP block group:", PALOALTO_IP_GROUP)
+    print("TLS verification:", PALOALTO_VERIFY_TLS)
+    print("Configured:", paloalto_configured())
 
     print()
     print("Routing")
     print("-" * 40)
-    print("IP, DOMAIN            -> FortiGate")
+    print("IP                    -> FortiGate DC, FortiGate DR, Palo Alto (whichever are configured)")
+    print("DOMAIN                -> FortiGate DC, FortiGate DR (whichever are configured)")
     print("URL, SHA1, SHA256     -> Trend Micro Apex Central")
 
     print()
@@ -1411,7 +1778,7 @@ def show_menu():
     while True:
         print()
         print("=" * 72)
-        print("THREAT INTEL IOC BLOCKER - APEX CENTRAL + FORTIGATE")
+        print("THREAT INTEL IOC BLOCKER - APEX CENTRAL + FORTIGATE (DC/DR) + PALO ALTO")
         print("=" * 72)
 
         print()
