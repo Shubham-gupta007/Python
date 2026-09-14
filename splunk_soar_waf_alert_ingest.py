@@ -20,8 +20,8 @@ Three ways to use this module:
    instead of touching the raw alert text.
 
 3. End-to-end ingestion - call `ingest_waf_alert(raw_text)` to create a SOAR
-   container/artifact with these CEF fields already populated (reuses the
-   SoarClient from splunk_soar_incident_ingest.py).
+   container/artifact with these CEF fields already populated (uses the
+   SoarClient class defined below).
 
 Configuration for ingestion is via environment variables:
   SOAR_BASE_URL      e.g. https://soar.example.com
@@ -31,16 +31,115 @@ Configuration for ingestion is via environment variables:
 
 import hashlib
 import json
+import logging
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+import requests
+import urllib3
 
 try:
     import phantom.rules as phantom  # available only inside SOAR's playbook runtime
 except ImportError:
     phantom = None
 
-from splunk_soar_incident_ingest import SoarClient
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("soar_ingest")
+
+
+class SoarClient:
+    """Thin wrapper around the Splunk SOAR REST API for container/artifact ingestion."""
+
+    def __init__(self, base_url: str, auth_token: str, verify_ssl: bool = True, timeout: int = 30):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            "ph-auth-token": auth_token,
+            "Content-Type": "application/json",
+        })
+        self.session.verify = verify_ssl
+        if not verify_ssl:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    def _post(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        url = f"{self.base_url}/rest/{endpoint}"
+        resp = self.session.post(url, data=json.dumps(payload), timeout=self.timeout)
+        if not resp.ok:
+            logger.error("POST %s failed (%s): %s", url, resp.status_code, resp.text)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = f"{self.base_url}/rest/{endpoint}"
+        resp = self.session.get(url, params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def find_container_by_sdi(self, source_data_identifier: str) -> Optional[int]:
+        """Look up an existing container by source_data_identifier to avoid duplicate ingestion."""
+        params = {
+            "_filter_source_data_identifier": json.dumps(source_data_identifier),
+            "page_size": 1,
+        }
+        result = self._get("container", params=params)
+        data = result.get("data") or []
+        return data[0]["id"] if data else None
+
+    def create_container(
+        self,
+        name: str,
+        description: str,
+        label: str,
+        severity: str,
+        source_data_identifier: str,
+        sensitivity: str = "amber",
+        status: str = "new",
+        tags: Optional[List[str]] = None,
+    ) -> int:
+        payload = {
+            "name": name,
+            "description": description,
+            "label": label,
+            "severity": severity,
+            "sensitivity": sensitivity,
+            "status": status,
+            "source_data_identifier": source_data_identifier,
+            "tags": tags or [],
+        }
+        result = self._post("container", payload)
+        container_id = result["id"]
+        logger.info("Created container %s (id=%s)", name, container_id)
+        return container_id
+
+    def add_artifact(
+        self,
+        container_id: int,
+        cef: Dict[str, Any],
+        name: str = "CEF Artifact",
+        label: str = "event",
+        severity: str = "medium",
+        source_data_identifier: Optional[str] = None,
+        cef_types: Optional[Dict[str, List[str]]] = None,
+        run_automation: bool = True,
+    ) -> int:
+        payload = {
+            "container_id": container_id,
+            "name": name,
+            "label": label,
+            "severity": severity,
+            "cef": cef,
+            "run_automation": run_automation,
+        }
+        if source_data_identifier:
+            payload["source_data_identifier"] = source_data_identifier
+        if cef_types:
+            payload["cef_types"] = cef_types
+        result = self._post("artifact", payload)
+        artifact_id = result["id"]
+        logger.info("Added artifact %s to container %s (artifact id=%s)", name, container_id, artifact_id)
+        return artifact_id
 
 
 def refang(text: str) -> str:
