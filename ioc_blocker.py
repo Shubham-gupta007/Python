@@ -69,7 +69,10 @@ Firewall platforms:
     would be far too slow for a bulk run).
 
 Requirements:
-    pip install requests
+    pip install requests openpyxl
+
+    openpyxl writes the multi-sheet .xlsx results workbook (see
+    "Output" below) - there's no CSV fallback, so it's required.
 
     Geo-IP checking needs no extra packages for either
     GEOIP_METHOD="offline" (default) or GEOIP_METHOD="virustotal" -
@@ -175,10 +178,19 @@ Input CSV format (column names are case-insensitive):
     SHA1,0123456789abcdef0123456789abcdef01234567,Dropper hash
     SHA256,c71ddfa376b2a86bae93d46d997742502d127979a8774402c936ec6832bb91d0,Ransomware hash
 
-Output: <input file name>_results.csv, with columns:
+Output: <input file name>_results_<YYYYMMDD_HHMMSS>.xlsx - a new,
+timestamped file every run, so nothing gets overwritten. It's an Excel
+workbook with four sheets, each using the same columns (Row, Type,
+Original_Value, Fixed_Value, Auto_Fixed, Description, Target_Tool,
+Country, Status, Detail, Processed_At):
 
-    Row, Type, Original_Value, Fixed_Value, Auto_Fixed, Description,
-    Target_Tool, Country, Status, Detail, Processed_At
+    Summary      - how many rows were Blocked/Failed/Invalid/Skipped/
+                   Would Block overall, and broken down by IOC type
+    Blocked      - only the rows that were successfully blocked
+    Not Blocked  - everything else (Failed, Invalid, Skipped, or
+                   Would Block in a dry run) - i.e. what did NOT end
+                   up blocked and may need a human look
+    All Results  - every row, unfiltered, for full traceability
 """
 
 import base64
@@ -1505,25 +1517,37 @@ def process_row(row_number, raw_type, raw_value, description):
 # FULL RUN
 # ============================================================
 
-def write_results_csv(output_file, results):
-    fieldnames = [
-        "Row",
-        "Type",
-        "Original_Value",
-        "Fixed_Value",
-        "Auto_Fixed",
-        "Description",
-        "Target_Tool",
-        "Country",
-        "Status",
-        "Detail",
-        "Processed_At",
-    ]
+RESULT_FIELDNAMES = [
+    "Row",
+    "Type",
+    "Original_Value",
+    "Fixed_Value",
+    "Auto_Fixed",
+    "Description",
+    "Target_Tool",
+    "Country",
+    "Status",
+    "Detail",
+    "Processed_At",
+]
 
-    with open(output_file, mode="w", encoding="utf-8", newline="") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(results)
+STATUS_KEYS = ("Blocked", "Failed", "Invalid", "Skipped", "Would Block")
+
+
+def compute_summary_counts(results):
+    """Returns (by_status, by_type) count dicts, shared by the console
+    summary and the workbook's Summary sheet."""
+    by_status = {}
+    by_type = {}
+
+    for row in results:
+        by_status[row["Status"]] = by_status.get(row["Status"], 0) + 1
+        by_type.setdefault(row["Type"], {key: 0 for key in STATUS_KEYS})
+        status = row["Status"]
+        if status in by_type[row["Type"]]:
+            by_type[row["Type"]][status] += 1
+
+    return by_status, by_type
 
 
 def print_summary(results):
@@ -1532,17 +1556,7 @@ def print_summary(results):
     print("SUMMARY")
     print("=" * 72)
 
-    by_status = {}
-    by_type = {}
-
-    status_keys = ("Blocked", "Failed", "Invalid", "Skipped", "Would Block")
-
-    for row in results:
-        by_status[row["Status"]] = by_status.get(row["Status"], 0) + 1
-        by_type.setdefault(row["Type"], {key: 0 for key in status_keys})
-        status = row["Status"]
-        if status in by_type[row["Type"]]:
-            by_type[row["Type"]][status] += 1
+    by_status, by_type = compute_summary_counts(results)
 
     print(f"Total rows processed: {len(results)}")
     for status, count in sorted(by_status.items()):
@@ -1558,6 +1572,95 @@ def print_summary(results):
             f"{ioc_type:<10} {counts['Blocked']:<10} {counts['Failed']:<10} "
             f"{counts['Invalid']:<10} {counts['Skipped']:<10} {counts['Would Block']:<12}"
         )
+
+
+def _autofit_columns(worksheet):
+    for column_cells in worksheet.columns:
+        length = max((len(str(cell.value)) for cell in column_cells if cell.value is not None), default=8)
+        worksheet.column_dimensions[column_cells[0].column_letter].width = min(length + 2, 60)
+
+
+def _write_detail_sheet(worksheet, rows):
+    from openpyxl.styles import Font, PatternFill
+
+    header_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
+
+    worksheet.append(RESULT_FIELDNAMES)
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+
+    for row in rows:
+        worksheet.append([row.get(field, "") for field in RESULT_FIELDNAMES])
+
+    worksheet.freeze_panes = "A2"
+    _autofit_columns(worksheet)
+
+
+def _write_summary_sheet(worksheet, results):
+    from openpyxl.styles import Font, PatternFill
+
+    header_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
+    bold = Font(bold=True)
+
+    by_status, by_type = compute_summary_counts(results)
+
+    worksheet.append(["Threat Intel IOC Blocker - Run Summary"])
+    worksheet["A1"].font = Font(bold=True, size=14)
+    worksheet.append([f"Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}"])
+    worksheet.append([f"Total rows processed: {len(results)}"])
+    worksheet.append([])
+
+    worksheet.append(["Status", "Count"])
+    for cell in worksheet[worksheet.max_row]:
+        cell.font = bold
+        cell.fill = header_fill
+    for status in STATUS_KEYS:
+        worksheet.append([status, by_status.get(status, 0)])
+    # Any status not in the known list (shouldn't normally happen) still gets counted.
+    for status, count in sorted(by_status.items()):
+        if status not in STATUS_KEYS:
+            worksheet.append([status, count])
+
+    worksheet.append([])
+
+    header_row = ["Type"] + list(STATUS_KEYS)
+    worksheet.append(header_row)
+    for cell in worksheet[worksheet.max_row]:
+        cell.font = bold
+        cell.fill = header_fill
+    for ioc_type, counts in sorted(by_type.items()):
+        worksheet.append([ioc_type] + [counts[key] for key in STATUS_KEYS])
+
+    _autofit_columns(worksheet)
+
+
+def write_results_workbook(output_file, results):
+    """
+    Writes the run's results as an .xlsx workbook with four sheets:
+        Summary      - counts by status, and by IOC type x status
+        Blocked      - every row that was successfully blocked
+        Not Blocked  - everything else (Failed/Invalid/Skipped/Would Block)
+        All Results  - every row, unfiltered (the full detail)
+    """
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+
+    summary_sheet = workbook.active
+    summary_sheet.title = "Summary"
+    _write_summary_sheet(summary_sheet, results)
+
+    blocked_sheet = workbook.create_sheet("Blocked")
+    _write_detail_sheet(blocked_sheet, [row for row in results if row["Status"] == "Blocked"])
+
+    not_blocked_sheet = workbook.create_sheet("Not Blocked")
+    _write_detail_sheet(not_blocked_sheet, [row for row in results if row["Status"] != "Blocked"])
+
+    all_results_sheet = workbook.create_sheet("All Results")
+    _write_detail_sheet(all_results_sheet, results)
+
+    workbook.save(output_file)
 
 
 def process_file(input_file, dry_run):
@@ -1699,8 +1802,9 @@ def process_file(input_file, dry_run):
                 print("WARNING: Palo Alto address/group changes were staged but NOT")
                 print("committed - review and commit manually via the Palo Alto UI/CLI.")
 
-    output_file = os.path.splitext(input_file)[0] + "_results.csv"
-    write_results_csv(output_file, results)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = f"{os.path.splitext(input_file)[0]}_results_{timestamp}.xlsx"
+    write_results_workbook(output_file, results)
 
     print_summary(results)
 
