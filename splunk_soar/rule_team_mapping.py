@@ -66,16 +66,23 @@ def get_team_for_rule(rule_name):
 def rule_team_mapping(rule_name=None, **kwargs):
     """
     Args:
-        rule_name (CEF type: *): Name of the triggered detection rule
+        rule_name (CEF type: string)
 
-    Returns:
-        dict: team_name (CEF type: *), matched_keyword (CEF type: *),
-              error (CEF type: *)
+    Returns a JSON-serializable object that implements the configured data paths:
+        team_name (CEF type: string)
+        matched_keyword (CEF type: string)
+        error (CEF type: string)
     """
     ############################ Custom Code Goes Below This Line #################################
+    import json
     import phantom.rules as phantom
 
-    outputs = {"team_name": "", "matched_keyword": "", "error": ""}
+    outputs = {}
+
+    # Write your custom code here...
+    outputs["team_name"] = DEFAULT_TEAM
+    outputs["matched_keyword"] = ""
+    outputs["error"] = ""
 
     try:
         team_name, matched_keyword = get_team_for_rule(rule_name)
@@ -89,6 +96,8 @@ def rule_team_mapping(rule_name=None, **kwargs):
         outputs["error"] = str(error)
         phantom.debug(f"rule_team_mapping: error - {error}")
 
+    # Return a JSON-serializable object
+    assert json.dumps(outputs)  # Will raise an exception if the :outputs: object is not JSON-serializable
     return outputs
     ############################ Custom Code Goes Above This Line #################################
 
