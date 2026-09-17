@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Splunk SOAR Custom Function - Rule Name to Team Mapping
+Splunk SOAR Utility (Custom Function) - Rule Name to Team Mapping
 
 Takes the name of a triggered detection rule (e.g. "WAF - Block SQLi",
 "Linux - Suspicious Cron Job", "Windows - Failed Logon Spike") and
@@ -11,16 +11,11 @@ Matching is keyword-based and case-insensitive: the rule name just
 needs to CONTAIN one of the known keywords anywhere in it, since real
 rule names rarely match a team name exactly.
 
-How to paste into SOAR:
-
-    1. Playbook editor -> Custom Function -> New Custom Function.
-    2. Input parameter: rule_name (string)
-    3. Output parameters: team_name (string), matched_keyword (string),
-       error (string)
-    4. Paste the body of rule_team_mapping_custom_function() into the
-       generated stub.
-    5. Put an Assign Ownership / Set Owner block after this one, wired
-       to the team_name output.
+rule_team_mapping() below is written in the exact shape SOAR generates
+for a Utility custom function block (a plain function that takes its
+Input Parameters as keyword arguments and returns a dict whose keys
+are the Output Parameter names) - see the bottom of this file / the
+chat explanation for the step-by-step of wiring it up in the UI.
 """
 
 # ============================================================
@@ -47,6 +42,7 @@ _KEYWORDS_BY_LENGTH = sorted(_KEYWORD_TO_TEAM, key=len, reverse=True)
 
 
 def get_team_for_rule(rule_name):
+    """Pure lookup logic, kept separate so it's unit-testable outside SOAR."""
     if not isinstance(rule_name, str) or not rule_name.strip():
         raise ValueError("rule_name is missing or empty.")
 
@@ -60,31 +56,64 @@ def get_team_for_rule(rule_name):
 
 
 # ============================================================
-# SOAR CUSTOM FUNCTION WRAPPER
+# SOAR UTILITY FUNCTION ENTRY POINT
+#
+# This is the part you paste into the Custom Function code editor.
+# Rename `rule_team_mapping` to match whatever name you give the
+# custom function in the UI - SOAR derives the def name from that.
 # ============================================================
 
-def rule_team_mapping_custom_function(rule_name=None, **kwargs):
+def rule_team_mapping(rule_name=None, **kwargs):
     """
-    Paste into the SOAR custom function editor.
-    Inputs:  rule_name (string)
-    Outputs: team_name (string), matched_keyword (string), error (string)
+    Args:
+        rule_name (CEF type: *): Name of the triggered detection rule
+
+    Returns:
+        dict: team_name (CEF type: *), matched_keyword (CEF type: *),
+              error (CEF type: *)
     """
+    ############################ Custom Code Goes Below This Line #################################
+    import phantom.rules as phantom
+
+    outputs = {"team_name": "", "matched_keyword": "", "error": ""}
+
     try:
         team_name, matched_keyword = get_team_for_rule(rule_name)
+        outputs["team_name"] = team_name
+        outputs["matched_keyword"] = matched_keyword
+        phantom.debug(
+            f"rule_team_mapping: rule_name='{rule_name}' -> "
+            f"team='{team_name}' matched_keyword='{matched_keyword}'"
+        )
     except ValueError as error:
-        return {"team_name": "", "matched_keyword": "", "error": str(error)}
+        outputs["error"] = str(error)
+        phantom.debug(f"rule_team_mapping: error - {error}")
 
-    return {"team_name": team_name, "matched_keyword": matched_keyword, "error": ""}
+    return outputs
+    ############################ Custom Code Goes Above This Line #################################
 
 
 if __name__ == "__main__":
+    # phantom.rules only exists inside SOAR - stub it out here so this
+    # file can still be smoke-tested locally the same way SOAR calls it.
+    import sys
+    import types
+
+    phantom_pkg = types.ModuleType("phantom")
+    phantom_rules_mod = types.ModuleType("phantom.rules")
+    phantom_rules_mod.debug = lambda message: print("[phantom.debug]", message)
+    phantom_pkg.rules = phantom_rules_mod
+    sys.modules["phantom"] = phantom_pkg
+    sys.modules["phantom.rules"] = phantom_rules_mod
+
     samples = [
         "WAF - Block SQL Injection Attempt",
         "Linux - Suspicious Cron Job Created",
         "Windows - Failed Logon Spike",
         "Active Directory - Kerberoasting Detected",
         "Unknown Rule - No Keyword Match",
+        "",
     ]
 
     for rule_name in samples:
-        print(rule_name, "->", rule_team_mapping_custom_function(rule_name))
+        print(rule_name, "->", rule_team_mapping(rule_name))
