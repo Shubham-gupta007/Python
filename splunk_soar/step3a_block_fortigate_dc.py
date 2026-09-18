@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Splunk SOAR Custom Function - Step 3: Block one IP/DOMAIN on FortiGate
+Splunk SOAR Custom Function - Step 3a: Block one IP/DOMAIN on FortiGate DC
 
-Takes an already-validated IP or DOMAIN from step 2 (only call this
-when step2's target_tool == "FORTIGATE") and creates the matching
-address object, then adds it to the block address group.
+Identical in every way to step3b_block_fortigate_dr.py except which
+site's credentials it reads (FORTIGATE_DC_* here, FORTIGATE_DR_* in
+the DR version) - kept as two separate files/custom functions so your
+playbook shows "Block on DC" and "Block on DR" as distinct, individually
+retryable blocks that both run for every IP/DOMAIN, the same dual-site
+behavior ioc_blocker.py's CLI tool has.
 
 --------------------------------------------------------------------
 Before writing this as a custom function: Splunk's own FortiGate app
@@ -21,19 +24,23 @@ this custom function instead.
 
 How to paste this into SOAR:
 
-    1. Playbook editor -> Custom Function -> New Custom Function.
+    1. Playbook editor -> Custom Function -> New Custom Function,
+       name it something like "block_fortigate_dc".
     2. Input parameters: ioc_type (string), value (string),
        comment (string)
     3. Output parameters: success (boolean), detail (string)
-    4. Paste the body of block_fortigate_custom_function() into the
+    4. Paste the body of block_fortigate_dc_custom_function() into the
        generated stub.
+    5. In the playbook, wire this block to run in parallel with
+       step3b (DR) for every IP/DOMAIN - both should fire, not
+       either/or, so DC and DR end up with the same block.
 
-Credentials: reads FORTIGATE_HOST / FORTIGATE_API_KEY / FORTIGATE_VDOM
-/ FORTIGATE_IP_GROUP / FORTIGATE_DOMAIN_GROUP from environment
-variables by default (handy for local testing). In SOAR, prefer
-pulling these from a configured Asset instead of hardcoding them in
-the playbook - see the commented block near the bottom of this file
-for the swap-in.
+Credentials: reads FORTIGATE_DC_HOST / FORTIGATE_DC_API_KEY /
+FORTIGATE_DC_VDOM / FORTIGATE_DC_IP_GROUP / FORTIGATE_DC_DOMAIN_GROUP
+from environment variables by default (handy for local testing). In
+SOAR, prefer pulling these from a configured Asset instead of
+hardcoding them in the playbook - see the commented block near the
+bottom of this file for the swap-in.
 """
 
 import ipaddress
@@ -42,12 +49,12 @@ import os
 import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-FORTIGATE_HOST = os.environ.get("FORTIGATE_HOST", "")
-FORTIGATE_API_KEY = os.environ.get("FORTIGATE_API_KEY", "")
-FORTIGATE_VDOM = os.environ.get("FORTIGATE_VDOM", "root")
-FORTIGATE_IP_GROUP = os.environ.get("FORTIGATE_IP_GROUP", "Blocked-IPs")
-FORTIGATE_DOMAIN_GROUP = os.environ.get("FORTIGATE_DOMAIN_GROUP", "Blocked-Domains")
-FORTIGATE_VERIFY_TLS = os.environ.get("FORTIGATE_VERIFY_TLS", "false").lower() == "true"
+FORTIGATE_HOST = os.environ.get("FORTIGATE_DC_HOST", "")
+FORTIGATE_API_KEY = os.environ.get("FORTIGATE_DC_API_KEY", "")
+FORTIGATE_VDOM = os.environ.get("FORTIGATE_DC_VDOM", "root")
+FORTIGATE_IP_GROUP = os.environ.get("FORTIGATE_DC_IP_GROUP", "Blocked-IPs")
+FORTIGATE_DOMAIN_GROUP = os.environ.get("FORTIGATE_DC_DOMAIN_GROUP", "Blocked-Domains")
+FORTIGATE_VERIFY_TLS = os.environ.get("FORTIGATE_DC_VERIFY_TLS", "false").lower() == "true"
 
 FORTIGATE_ADDRESS_PATH = "/api/v2/cmdb/firewall/address"
 FORTIGATE_GROUP_PATH = "/api/v2/cmdb/firewall/addrgrp"
@@ -160,7 +167,7 @@ def fortigate_add_to_group(group_name, member_name):
     return False, f"HTTP {response.status_code} - could not update group '{group_name}'"
 
 
-def block_via_fortigate(ioc_type, value, comment):
+def block_via_fortigate_dc(ioc_type, value, comment):
     payload = build_fortigate_payload(ioc_type, value, comment)
 
     success, response = fortigate_create_or_update_address(payload)
@@ -170,13 +177,13 @@ def block_via_fortigate(ioc_type, value, comment):
             body = response.json()
         except ValueError:
             body = response.text
-        return False, f"HTTP {response.status_code} - address object failed: {body}"
+        return False, f"[DC] HTTP {response.status_code} - address object failed: {body}"
 
     group = FORTIGATE_IP_GROUP if ioc_type == "IP" else FORTIGATE_DOMAIN_GROUP
     group_success, group_detail = fortigate_add_to_group(group, value)
 
     address_type = "ipmask" if ioc_type == "IP" else "fqdn"
-    detail = f"HTTP {response.status_code} - {address_type} address created/updated, {group_detail}"
+    detail = f"[DC] HTTP {response.status_code} - {address_type} address created/updated, {group_detail}"
 
     return group_success, detail
 
@@ -185,7 +192,7 @@ def block_via_fortigate(ioc_type, value, comment):
 # SOAR CUSTOM FUNCTION WRAPPER
 # ============================================================
 
-def block_fortigate_custom_function(ioc_type=None, value=None, comment=None, **kwargs):
+def block_fortigate_dc_custom_function(ioc_type=None, value=None, comment=None, **kwargs):
     """
     Paste into the SOAR custom function editor.
     Inputs:  ioc_type (string, "IP" or "DOMAIN"), value (string),
@@ -194,13 +201,13 @@ def block_fortigate_custom_function(ioc_type=None, value=None, comment=None, **k
 
     ---- SOAR-asset version of the credentials (recommended for
     production instead of environment variables) ----
-    # asset_config = phantom.get_asset_config("fortigate")
+    # asset_config = phantom.get_asset_config("fortigate_dc")
     # global FORTIGATE_HOST, FORTIGATE_API_KEY
     # FORTIGATE_HOST = asset_config["fortigate_host"]
     # FORTIGATE_API_KEY = asset_config["api_key"]
     """
     try:
-        success, detail = block_via_fortigate(ioc_type, value, comment or "")
+        success, detail = block_via_fortigate_dc(ioc_type, value, comment or "")
     except Exception as error:
         return {"success": False, "detail": f"Exception: {error}"}
 
@@ -208,7 +215,6 @@ def block_fortigate_custom_function(ioc_type=None, value=None, comment=None, **k
 
 
 if __name__ == "__main__":
-    print("This module expects live FortiGate credentials to actually run.")
+    print("This module expects live FortiGate DC credentials to actually run.")
     print("build_fortigate_payload('IP', '203.0.113.50', 'test') ->")
     print(build_fortigate_payload("IP", "203.0.113.50", "test"))
-    print(build_fortigate_payload("DOMAIN", "evil.example.com", "test"))
