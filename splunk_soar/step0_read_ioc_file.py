@@ -13,127 +13,109 @@ case-insensitive).
 
 Use this instead of step1_extract_iocs.py when the advisory attachment
 IS the structured CSV (type/indicator/description columns) rather than
-a prose report you'd need to regex IOCs out of. If the advisory is a
-PDF/email body/report, use step1_extract_iocs.py (or Splunk's own
-"Parser" app - Splunkbase id 5832 - which has a built-in "extract ioc"
-action) instead of this file.
+a prose report you'd need to regex IOCs out of.
 
-How to paste this into SOAR:
+No external libraries - csv/json/io are all standard library, and
+phantom.rules is SOAR's own built-in module (not a pip package).
 
-    1. Playbook editor -> Custom Function -> New Custom Function.
+How to use in SOAR:
+
+    1. Playbook editor -> Custom Function -> New Custom Function,
+       name it "read_ioc_file".
     2. Input parameter: vault_id (string) - wire this to the vault ID
-       of the CSV artifact/attachment (e.g. the container's
-       "vault_id" CEF field, or an "Add Output" -> Data Path pointing
-       at the attachment artifact).
+       of the CSV artifact/attachment.
     3. Output parameters: iocs_json (string), ioc_count (number),
        error (string)
-    4. Paste the body of read_ioc_file_custom_function() into the
-       generated stub.
+    4. SOAR generates a locked def/docstring block down to the
+       "Custom Code Goes Below This Line" marker. Paste everything
+       from "import csv" below into the editor in place of its
+       placeholder outputs = {} / "Write your custom code here" lines.
     5. Feed iocs_json into a small Format/Filter block that does
        json.loads(iocs_json) so the playbook has a real list to loop
-       over (see the "wiring the loop" notes in step2's docstring).
+       over (see step2's docstring for the loop wiring).
 """
 
-import csv
-import io
 
-
-def detect_value_column(fieldnames):
-    for candidate in ("indicator", "value"):
-        if candidate in fieldnames:
-            return candidate
-    return None
-
-
-def parse_ioc_csv_text(csv_text):
+def read_ioc_file(vault_id=None, **kwargs):
     """
-    Core parsing logic - same column rules as ioc_blocker.py's
-    load_csv_rows(): requires "type" plus "indicator" or "value",
-    "description" optional. Returns a list of
-    {"type": ..., "value": ..., "description": ...} dicts.
+    Args:
+        vault_id (CEF type: vault id) -- the CSV attachment's vault ID
+
+    Returns a JSON-serializable object that implements the configured data paths:
+        iocs_json (CEF type: string)
+        ioc_count (CEF type: numeric)
+        error (CEF type: string)
     """
-    sample = csv_text[:4096]
-
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=",;|\t")
-    except csv.Error:
-        dialect = csv.excel
-
-    reader = csv.DictReader(io.StringIO(csv_text), dialect=dialect)
-
-    if reader.fieldnames:
-        reader.fieldnames = [field.strip().lower() if field else field for field in reader.fieldnames]
-
-    fieldnames = reader.fieldnames or []
-
-    if "type" not in fieldnames:
-        raise ValueError(f"CSV must contain a 'type' column. Found: {fieldnames}")
-
-    value_column = detect_value_column(fieldnames)
-    if value_column is None:
-        raise ValueError(f"CSV must contain an 'indicator' (or 'value') column. Found: {fieldnames}")
-
-    iocs = []
-
-    for row in reader:
-        raw_type = (row.get("type") or "").strip()
-        raw_value = (row.get(value_column) or "").strip()
-        description = (row.get("description") or "").strip()
-
-        if not raw_type and not raw_value:
-            continue
-
-        iocs.append({"type": raw_type, "value": raw_value, "description": description})
-
-    return iocs
-
-
-# ============================================================
-# SOAR CUSTOM FUNCTION WRAPPER
-# ============================================================
-
-def read_ioc_file_custom_function(vault_id=None, **kwargs):
-    """
-    Paste into the SOAR custom function editor.
-    Input:   vault_id (string)
-    Outputs: iocs_json (string), ioc_count (number), error (string)
-    """
+    ########################## Custom Code Goes Below This Line ##########################
+    import csv
+    import io
     import json
+    import phantom.rules as phantom
+
+    outputs = {"iocs_json": "[]", "ioc_count": 0, "error": ""}
 
     if not vault_id:
-        return {"iocs_json": "[]", "ioc_count": 0, "error": "No vault_id provided."}
+        outputs["error"] = "No vault_id provided."
+        assert json.dumps(outputs)
+        return outputs
 
     try:
-        import phantom.rules as phantom
-
         success, message, vault_info_list = phantom.vault_info(vault_id=vault_id)
 
         if not success or not vault_info_list:
-            return {"iocs_json": "[]", "ioc_count": 0, "error": f"Could not read vault file: {message}"}
+            outputs["error"] = f"Could not read vault file: {message}"
+            assert json.dumps(outputs)
+            return outputs
 
         file_path = vault_info_list[0]["path"]
 
         with open(file_path, "r", encoding="utf-8-sig") as csv_file:
             csv_text = csv_file.read()
 
-    except ImportError:
-        # Not running inside SOAR - lets this file be unit tested standalone.
-        with open(vault_id, "r", encoding="utf-8-sig") as csv_file:
-            csv_text = csv_file.read()
+        sample = csv_text[:4096]
 
-    try:
-        iocs = parse_ioc_csv_text(csv_text)
-    except ValueError as error:
-        return {"iocs_json": "[]", "ioc_count": 0, "error": str(error)}
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;|\t")
+        except csv.Error:
+            dialect = csv.excel
 
-    return {"iocs_json": json.dumps(iocs), "ioc_count": len(iocs), "error": ""}
+        reader = csv.DictReader(io.StringIO(csv_text), dialect=dialect)
 
+        if reader.fieldnames:
+            reader.fieldnames = [field.strip().lower() if field else field for field in reader.fieldnames]
 
-if __name__ == "__main__":
-    sample_csv = (
-        "type,indicator,description\n"
-        "IP,192.168.1[.]100,C2 server\n"
-        "DOMAIN,evil[.]example[.]com,Phishing domain\n"
-        "URL,hxxps://evil.example.com/malware.exe,Malware URL\n"
-    )
-    print(parse_ioc_csv_text(sample_csv))
+        fieldnames = reader.fieldnames or []
+
+        if "type" not in fieldnames:
+            outputs["error"] = f"CSV must contain a 'type' column. Found: {fieldnames}"
+            assert json.dumps(outputs)
+            return outputs
+
+        value_column = "indicator" if "indicator" in fieldnames else ("value" if "value" in fieldnames else None)
+
+        if value_column is None:
+            outputs["error"] = f"CSV must contain an 'indicator' (or 'value') column. Found: {fieldnames}"
+            assert json.dumps(outputs)
+            return outputs
+
+        iocs = []
+
+        for row in reader:
+            raw_type = (row.get("type") or "").strip()
+            raw_value = (row.get(value_column) or "").strip()
+            description = (row.get("description") or "").strip()
+
+            if not raw_type and not raw_value:
+                continue
+
+            iocs.append({"type": raw_type, "value": raw_value, "description": description})
+
+        outputs["iocs_json"] = json.dumps(iocs)
+        outputs["ioc_count"] = len(iocs)
+
+    except Exception as error:
+        outputs["error"] = f"Exception: {error}"
+
+    # Return a JSON-serializable object
+    assert json.dumps(outputs)  # Will raise an exception if the :outputs: object is not JSON-serializable
+    return outputs
