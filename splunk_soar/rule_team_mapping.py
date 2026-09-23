@@ -29,9 +29,29 @@ TEAM_KEYWORDS = {
     "Network": ["waf", "firewall", "ids", "ips", "network"],
     "Computer": ["linux", "unix", "endpoint", "server"],
     "Windows": ["windows", "win", "active directory", "ad "],
+    "Information Security": [
+        "information security",
+        "infosec",
+        "malware",
+        "phishing",
+        "threat intel",
+        "vulnerability",
+    ],
 }
 
 DEFAULT_TEAM = "Unassigned"
+
+# ============================================================
+# TEAM -> ASSIGNED GROUP MAPPING
+#
+# A team not listed here (e.g. Computer, Windows, Unassigned) gets an
+# empty assigned_group until its group is added below.
+# ============================================================
+
+TEAM_ASSIGNED_GROUP = {
+    "Network": "Managed Service",
+    "Information Security": "Security",
+}
 
 # Flatten to keyword -> team, longest keyword first so a more specific
 # match (e.g. "active directory") wins over a shorter, looser one.
@@ -55,6 +75,10 @@ def get_team_for_rule(rule_name):
     return DEFAULT_TEAM, ""
 
 
+def get_assigned_group(team_name):
+    return TEAM_ASSIGNED_GROUP.get(team_name, "")
+
+
 # ============================================================
 # SOAR UTILITY FUNCTION ENTRY POINT
 #
@@ -71,6 +95,7 @@ def rule_team_mapping(rule_name=None, **kwargs):
     Returns a JSON-serializable object that implements the configured data paths:
         team_name (CEF type: string)
         matched_keyword (CEF type: string)
+        assigned_group (CEF type: string)
         error (CEF type: string)
     """
     ############################ Custom Code Goes Below This Line #################################
@@ -82,15 +107,18 @@ def rule_team_mapping(rule_name=None, **kwargs):
     # Write your custom code here...
     outputs["team_name"] = DEFAULT_TEAM
     outputs["matched_keyword"] = ""
+    outputs["assigned_group"] = ""
     outputs["error"] = ""
 
     try:
         team_name, matched_keyword = get_team_for_rule(rule_name)
         outputs["team_name"] = team_name
         outputs["matched_keyword"] = matched_keyword
+        outputs["assigned_group"] = get_assigned_group(team_name)
         phantom.debug(
             f"rule_team_mapping: rule_name='{rule_name}' -> "
-            f"team='{team_name}' matched_keyword='{matched_keyword}'"
+            f"team='{team_name}' matched_keyword='{matched_keyword}' "
+            f"assigned_group='{outputs['assigned_group']}'"
         )
     except ValueError as error:
         outputs["error"] = str(error)
@@ -120,6 +148,8 @@ if __name__ == "__main__":
         "Linux - Suspicious Cron Job Created",
         "Windows - Failed Logon Spike",
         "Active Directory - Kerberoasting Detected",
+        "Malware - Ransomware Behavior Detected",
+        "Phishing - Suspicious Email Reported",
         "Unknown Rule - No Keyword Match",
         "",
     ]
