@@ -44,10 +44,27 @@ Ticket lookup:
 Input:
 
     Incident IDs on the command line and/or a file (-f). The file can
-    be plain text (one ID per line, or comma separated), a CSV with an
-    "Incident Number" / "incident_id" / "id" column, or a JSON list:
+    be a CSV with an incident column (header "Incident Number",
+    "Incident ID", "Incident", "Ticket", "ID", ... - any case), plain
+    text (one ID per line, or comma separated), or a JSON list:
 
         ["INC000000123456", "INC000000123457"]
+
+    A header-less CSV is also accepted: every cell is read as an ID.
+
+
+Output:
+
+    A CSV with one row per incident, in input order:
+
+        Incident Number, Status, Status_Reason, Resolution,
+        Resolution Category, Last Resolved Date, Priority,
+        Assigned Group, Assignee, Last Modified Date, Description
+
+    With -f and no -o, it is written next to the input file as
+    <input name>_status.csv. Tickets Remedy does not know are written
+    with Status "NOT FOUND"; lookups that failed get Status "ERROR"
+    with the reason in the Remarks column.
 
 
 Requirements:
@@ -69,9 +86,10 @@ Environment:
 Run:
 
     python3 bmc_remedy_ticket_status.py INC000000123456 INC000000123457
-    python3 bmc_remedy_ticket_status.py -f incidents.txt
-    python3 bmc_remedy_ticket_status.py -f incidents.txt -o status.csv
-    python3 bmc_remedy_ticket_status.py -f incidents.txt -o status.json
+    python3 bmc_remedy_ticket_status.py -f incidents.csv
+        -> incidents_status.csv
+    python3 bmc_remedy_ticket_status.py -f incidents.csv -o status.csv
+    python3 bmc_remedy_ticket_status.py -f incidents.csv -o status.json
 """
 
 
@@ -111,12 +129,26 @@ INCIDENT_FIELDS = [
     "Incident Number",
     "Status",
     "Status_Reason",
+    "Resolution",
+    "Resolution Category",
+    "Last Resolved Date",
     "Priority",
     "Assigned Group",
     "Assignee",
-    "Description",
     "Last Modified Date",
+    "Description",
 ]
+
+# Output columns = Remedy fields + our own note for NOT FOUND / ERROR.
+OUTPUT_COLUMNS = INCIDENT_FIELDS + ["Remarks"]
+
+# Header names (lower-case) recognised as the incident column in an
+# input CSV, most specific first.
+INCIDENT_COLUMN_NAMES = (
+    "incident number", "incident_number", "incident id", "incident_id",
+    "incident", "incident no", "ticket number", "ticket id", "ticket",
+    "id",
+)
 
 # Incidents per query. Keeps the URL (q=... OR ...) well under
 # typical web server / proxy URL length limits.
@@ -404,16 +436,27 @@ def read_ids_from_file(path):
         data = json.loads(stripped)
         return [str(item) for item in data]
 
-    lines = stripped.splitlines()
-    if lines:
-        header = [h.strip().lower() for h in lines[0].split(",")]
-        for column in ("incident number", "incident_id", "incident id", "id"):
-            if column in header:
-                reader = csv.DictReader(lines)
-                key = reader.fieldnames[header.index(column)]
-                return [row.get(key, "") for row in reader]
+    rows = list(csv.reader(stripped.splitlines()))
+    if not rows:
+        return []
 
-    return re.split(r"[\s,;]+", stripped)
+    header = [h.strip().lower() for h in rows[0]]
+    for column in INCIDENT_COLUMN_NAMES:
+        if column in header:
+            index = header.index(column)
+            return [row[index] for row in rows[1:] if len(row) > index]
+
+    # No recognised header: an incident-looking cell anywhere in the
+    # first row means there is no header at all, so take every cell.
+    cells = [cell for row in rows for cell in row]
+    if any(INCIDENT_ID_PATTERN.match(c.strip().upper()) for c in rows[0]):
+        return cells
+
+    raise ValueError(
+        "{}: could not find the incident column. Name it one of: {}".format(
+            path, ", ".join('"{}"'.format(c) for c in INCIDENT_COLUMN_NAMES)
+        )
+    )
 
 
 def normalize_ids(raw_ids):
@@ -450,12 +493,16 @@ def build_rows(results):
 
     for incident_id, values in results.items():
         if values is None:
-            rows.append({"Incident Number": incident_id, "Status": "NOT FOUND"})
+            rows.append({
+                "Incident Number": incident_id,
+                "Status": "NOT FOUND",
+                "Remarks": "No incident with this number in Remedy",
+            })
         elif "error" in values:
             rows.append({
                 "Incident Number": incident_id,
                 "Status": "ERROR",
-                "Description": values["error"],
+                "Remarks": values["error"],
             })
         else:
             row = {field: values.get(field) for field in INCIDENT_FIELDS}
@@ -467,7 +514,7 @@ def build_rows(results):
 
 def print_table(rows):
     columns = ["Incident Number", "Status", "Status_Reason",
-               "Priority", "Assigned Group", "Assignee"]
+               "Resolution Category", "Assigned Group"]
 
     def cell(value):
         return "" if value is None else str(value)
@@ -488,11 +535,16 @@ def save_rows(rows, path):
             json.dump(rows, handle, indent=2)
         return
 
-    with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=INCIDENT_FIELDS)
+    # utf-8-sig so Excel shows non-ASCII text correctly. Multi-line
+    # Resolution text is quoted by the csv module and stays in one cell.
+    with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
         writer.writeheader()
         for row in rows:
-            writer.writerow({f: row.get(f, "") for f in INCIDENT_FIELDS})
+            writer.writerow({
+                c: "" if row.get(c) is None else row.get(c)
+                for c in OUTPUT_COLUMNS
+            })
 
 
 # ============================================================
@@ -509,11 +561,12 @@ def parse_args():
     )
     parser.add_argument(
         "-f", "--file",
-        help="File with incident numbers (txt, csv or json list)",
+        help="File with incident numbers (csv, txt or json list)",
     )
     parser.add_argument(
         "-o", "--output",
-        help="Save results to this file (.csv or .json)",
+        help="Save results to this file (.csv or .json). Default with "
+             "-f: <input name>_status.csv next to the input file",
     )
     return parser.parse_args()
 
@@ -523,7 +576,13 @@ def main():
 
     raw_ids = list(args.incidents)
     if args.file:
-        raw_ids.extend(read_ids_from_file(args.file))
+        try:
+            raw_ids.extend(read_ids_from_file(args.file))
+        except (OSError, ValueError) as exc:
+            print("ERROR: {}".format(exc), file=sys.stderr)
+            return 2
+        if not args.output:
+            args.output = os.path.splitext(args.file)[0] + "_status.csv"
 
     incident_ids = normalize_ids(raw_ids)
     if not incident_ids:
