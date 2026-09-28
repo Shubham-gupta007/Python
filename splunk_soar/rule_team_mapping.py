@@ -76,7 +76,7 @@ def rule_team_mapping(rule_name=None, **kwargs):
         # specific match (e.g. "active directory") wins over a
         # shorter, looser one (e.g. "ad ").
         keyword_to_team = {
-            keyword: team
+            keyword.lower(): team
             for team, keywords in team_keywords.items()
             for keyword in keywords
         }
