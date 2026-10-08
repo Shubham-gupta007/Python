@@ -28,7 +28,9 @@ Docs: https://docs.bmc.com -> Remedy AR System REST API -> Entry endpoints
 Requirements:
     Python 3.6+ standard library only - no pip packages needed.
 
-Environment variables:
+Settings - edit the SETTINGS block below the imports, or set environment
+variables with the same names (they take priority), or pass --host and
+--username on the command line. Anything missing is asked for at run time.
 
     BMC_HOST          e.g. "https://remedy.example.com:8443" (no trailing slash)
     BMC_USERNAME      Remedy user with read access to HPD:Help Desk
@@ -48,6 +50,7 @@ Environment variables:
 Run:
 
     python3 bmc_remedy_cpx_mttr_report.py
+    python3 bmc_remedy_cpx_mttr_report.py --host https://remedy.example.com:8443 --username jsmith
     python3 bmc_remedy_cpx_mttr_report.py --year 2026 --months 7 8 9
     python3 bmc_remedy_cpx_mttr_report.py --output cpx_q3.csv
 
@@ -67,6 +70,23 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+
+# =========================================================================== #
+#  SETTINGS - fill these in, then just run:  python bmc_remedy_cpx_mttr_report.py
+#  (An environment variable with the same name overrides the value here.
+#   Anything left empty is asked for when the script runs.)
+# =========================================================================== #
+
+BMC_HOST = ""            # e.g. "https://remedy.example.com:8443" (no trailing /)
+BMC_USERNAME = ""        # e.g. "jsmith"
+BMC_PASSWORD = ""        # leave empty to be prompted (recommended)
+BMC_PREFIX = "CPX"
+BMC_PREFIX_FIELD = "Incident Number"
+BMC_DETECT_FIELD = "Reported Date"
+BMC_TIMEZONE = ""        # e.g. "+05:30"; empty = this machine's time zone
+BMC_VERIFY_TLS = "true"  # "false" for a self-signed certificate
+
+# =========================================================================== #
 
 FORM = "HPD:Help Desk"
 PAGE_SIZE = 500
@@ -307,26 +327,39 @@ def write_report(rows, months, year, detect_field, prefix, path):
 # Main
 # --------------------------------------------------------------------------- #
 
+def setting(name):
+    """Environment variable if set (and non-empty), else the SETTINGS value."""
+    return (os.environ.get(name) or globals()[name] or "").strip()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--year", type=int, default=datetime.now().year,
                         help="year to report on (default: current year)")
     parser.add_argument("--months", type=int, nargs="+", default=[7, 8, 9],
                         help="month numbers to include (default: 7 8 9)")
+    parser.add_argument("--host", help="Remedy URL, overrides BMC_HOST")
+    parser.add_argument("--username", help="Remedy user, overrides BMC_USERNAME")
     parser.add_argument("--output",
                         help="output .csv path (default: timestamped name)")
     args = parser.parse_args()
 
-    host = os.environ.get("BMC_HOST", "").rstrip("/")
-    username = os.environ.get("BMC_USERNAME")
-    if not host or not username:
-        sys.exit("Set BMC_HOST and BMC_USERNAME (see the header of this script).")
-    password = os.environ.get("BMC_PASSWORD") or getpass.getpass("Remedy password: ")
-    prefix = os.environ.get("BMC_PREFIX", "CPX")
-    prefix_field = os.environ.get("BMC_PREFIX_FIELD", "Incident Number")
-    detect_field = os.environ.get("BMC_DETECT_FIELD", "Reported Date")
-    ctx = ssl_context(os.environ.get("BMC_VERIFY_TLS", "true").lower() != "false")
-    tz = resolve_timezone(os.environ.get("BMC_TIMEZONE"))
+    host = (args.host or setting("BMC_HOST")
+            or input("Remedy URL (e.g. https://remedy.example.com:8443): "))
+    host = host.strip().rstrip("/")
+    if not host.lower().startswith(("http://", "https://")):
+        host = "https://" + host
+    username = (args.username or setting("BMC_USERNAME")
+                or input("Remedy username: ")).strip()
+    if not username:
+        sys.exit("A Remedy username is required.")
+    password = setting("BMC_PASSWORD") or getpass.getpass("Remedy password: ")
+    prefix = setting("BMC_PREFIX")
+    prefix_field = setting("BMC_PREFIX_FIELD")
+    detect_field = setting("BMC_DETECT_FIELD")
+    ctx = ssl_context(setting("BMC_VERIFY_TLS").lower() != "false")
+    tz = resolve_timezone(setting("BMC_TIMEZONE"))
+    print(f"Connecting to {host} as {username}")
 
     months = sorted(set(args.months))
     if any(m < 1 or m > 12 for m in months):
