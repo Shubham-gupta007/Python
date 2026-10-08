@@ -1,68 +1,72 @@
 #!/usr/bin/env python3
-"""
-BMC Remedy (Helix ITSM) - CPX Incident MTTR Report via REST API
 
-Pulls every incident from the HPD:Help Desk form whose Incident Number
-starts with "CPX" and whose Submit Date falls in July, August or September,
-then writes a CSV report (opens directly in Excel) with:
+# =========================================================================== #
+#                              CONFIGURATION                                  #
+#           Fill in your values below, save, and run the script.              #
+# =========================================================================== #
 
-    Incident section -> Incident Number, Summary, Status, Priority, Month,
-                        Reported Date, Submit Date, Last Resolved Date,
-                        Time to Detect, Time to Resolve
-    Summary section  -> per-month and overall incident count, resolved
-                        count, Average MTTR and Average Time to Detect
+# Remedy REST API URL: protocol + server + port, no "/" at the end.
+BMC_URL = "https://remedy.example.com:8443"
 
-Definitions:
+# Remedy login (needs read access to the HPD:Help Desk form).
+BMC_USERNAME = "your_username"
+BMC_PASSWORD = "your_password"
 
-    Time to Detect  (TTD)  = Submit Date        - Reported Date
-    Time to Resolve (TTR)  = Last Resolved Date - Submit Date
-    MTTR                   = average TTR of the resolved incidents
-                             (open incidents have no Last Resolved Date
-                             and are left out of the average)
+# Report options.
+YEAR = 2026                      # year to report on
+MONTHS = [7, 8, 9]               # July, August, September
+INCIDENT_PREFIX = "CPX"          # incidents whose number starts with this
+PREFIX_FIELD = "Incident Number" # field the prefix is matched on
+DETECT_FIELD = "Reported Date"   # Time to Detect = Submit Date - this field
+TIMEZONE = ""                    # e.g. "+05:30"; "" = this machine's time zone
+VERIFY_TLS = True                # False if the server uses a self-signed cert
+OUTPUT_FILE = ""                 # "" = CPX_incident_mttr_report_<timestamp>.csv
 
-Authentication: AR-JWT token from POST /api/jwt/login, sent as
-"Authorization: AR-JWT <token>"; the token is released on exit.
+# =========================================================================== #
+#                     Nothing below needs to be changed.                      #
+# =========================================================================== #
 
-Docs: https://docs.bmc.com -> Remedy AR System REST API -> Entry endpoints
-
-Requirements:
-    Python 3.6+ standard library only - no pip packages needed.
-
-Settings - edit the SETTINGS block below the imports, or set environment
-variables with the same names (they take priority), or pass --host and
---username on the command line. Anything missing is asked for at run time.
-
-    BMC_HOST          e.g. "https://remedy.example.com:8443" (no trailing slash)
-    BMC_USERNAME      Remedy user with read access to HPD:Help Desk
-    BMC_PASSWORD      that user's password (prompted for if not set)
-    BMC_PREFIX        optional, defaults to "CPX"
-    BMC_PREFIX_FIELD  optional, field the prefix is matched on,
-                      defaults to "Incident Number"
-    BMC_DETECT_FIELD  optional, start field for Time to Detect,
-                      defaults to "Reported Date"
-    BMC_TIMEZONE      optional, time zone for month boundaries and the dates
-                      in the report: a UTC offset such as "+05:30", or an
-                      IANA name such as "Asia/Kolkata" (Python 3.9+, and on
-                      Windows only if tzdata is present). Defaults to the
-                      machine's local zone.
-    BMC_VERIFY_TLS    optional, "true"/"false", defaults to "true"
-
-Run:
-
-    python3 bmc_remedy_cpx_mttr_report.py
-    python3 bmc_remedy_cpx_mttr_report.py --host https://remedy.example.com:8443 --username jsmith
-    python3 bmc_remedy_cpx_mttr_report.py --year 2026 --months 7 8 9
-    python3 bmc_remedy_cpx_mttr_report.py --output cpx_q3.csv
-
-    Without --year the current year is used.
-"""
+# BMC Remedy (Helix ITSM) - CPX Incident MTTR Report via REST API
+#
+# Pulls every incident from the HPD:Help Desk form whose Incident Number
+# starts with "CPX" and whose Submit Date falls in July, August or September,
+# then writes a CSV report (opens directly in Excel) with:
+#
+#     Incident section -> Incident Number, Summary, Status, Priority, Month,
+#                         Reported Date, Submit Date, Last Resolved Date,
+#                         Time to Detect, Time to Resolve
+#     Summary section  -> per-month and overall incident count, resolved
+#                         count, Average MTTR and Average Time to Detect
+#
+# Definitions:
+#
+#     Time to Detect  (TTD)  = Submit Date        - Reported Date
+#     Time to Resolve (TTR)  = Last Resolved Date - Submit Date
+#     MTTR                   = average TTR of the resolved incidents
+#                              (open incidents have no Last Resolved Date
+#                              and are left out of the average)
+#
+# Authentication: AR-JWT token from POST /api/jwt/login, sent as
+# "Authorization: AR-JWT <token>"; the token is released on exit.
+#
+# Docs: https://docs.bmc.com -> Remedy AR System REST API -> Entry endpoints
+#
+# Requirements:
+#     Python 3.6+ standard library only - no pip packages needed.
+#
+# Run (after filling in CONFIGURATION above):
+#
+#     python3 bmc_remedy_cpx_mttr_report.py
+#     python3 bmc_remedy_cpx_mttr_report.py --year 2025 --months 7 8 9
+#     python3 bmc_remedy_cpx_mttr_report.py --output cpx_q3.csv
+#
+#     Without --year, YEAR from CONFIGURATION is used.
 
 import argparse
 import calendar
 import csv
 import getpass
 import json
-import os
 import re
 import ssl
 import sys
@@ -70,23 +74,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
-
-# =========================================================================== #
-#  SETTINGS - fill these in, then just run:  python bmc_remedy_cpx_mttr_report.py
-#  (An environment variable with the same name overrides the value here.
-#   Anything left empty is asked for when the script runs.)
-# =========================================================================== #
-
-BMC_HOST = ""            # e.g. "https://remedy.example.com:8443" (no trailing /)
-BMC_USERNAME = ""        # e.g. "jsmith"
-BMC_PASSWORD = ""        # leave empty to be prompted (recommended)
-BMC_PREFIX = "CPX"
-BMC_PREFIX_FIELD = "Incident Number"
-BMC_DETECT_FIELD = "Reported Date"
-BMC_TIMEZONE = ""        # e.g. "+05:30"; empty = this machine's time zone
-BMC_VERIFY_TLS = "true"  # "false" for a self-signed certificate
-
-# =========================================================================== #
 
 FORM = "HPD:Help Desk"
 PAGE_SIZE = 500
@@ -195,7 +182,7 @@ def resolve_timezone(name):
         from zoneinfo import ZoneInfo
         return ZoneInfo(name)
     except Exception:
-        sys.exit(f"Unknown BMC_TIMEZONE {name!r}; use a UTC offset like +05:30.")
+        sys.exit(f"Unknown TIMEZONE {name!r}; use a UTC offset like +05:30.")
 
 
 def parse_remedy_date(value, tz):
@@ -327,45 +314,43 @@ def write_report(rows, months, year, detect_field, prefix, path):
 # Main
 # --------------------------------------------------------------------------- #
 
-def setting(name):
-    """Environment variable if set (and non-empty), else the SETTINGS value."""
-    return (os.environ.get(name) or globals()[name] or "").strip()
-
-
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--year", type=int, default=datetime.now().year,
-                        help="year to report on (default: current year)")
-    parser.add_argument("--months", type=int, nargs="+", default=[7, 8, 9],
-                        help="month numbers to include (default: 7 8 9)")
-    parser.add_argument("--host", help="Remedy URL, overrides BMC_HOST")
-    parser.add_argument("--username", help="Remedy user, overrides BMC_USERNAME")
-    parser.add_argument("--output",
+    parser = argparse.ArgumentParser(
+        description="BMC Remedy CPX incident MTTR report (CSV). "
+                    "Values come from the CONFIGURATION section at the top "
+                    "of this file; these options override them for one run.")
+    parser.add_argument("--year", type=int, default=YEAR,
+                        help=f"year to report on (default: {YEAR})")
+    parser.add_argument("--months", type=int, nargs="+", default=MONTHS,
+                        help=f"month numbers (default: {' '.join(map(str, MONTHS))})")
+    parser.add_argument("--output", default=OUTPUT_FILE,
                         help="output .csv path (default: timestamped name)")
     args = parser.parse_args()
 
-    host = (args.host or setting("BMC_HOST")
-            or input("Remedy URL (e.g. https://remedy.example.com:8443): "))
-    host = host.strip().rstrip("/")
+    host = BMC_URL.strip().rstrip("/")
+    username = BMC_USERNAME.strip()
+    password = BMC_PASSWORD
+    if (not host or "example.com" in host or not username
+            or username == "your_username"):
+        sys.exit("Edit the CONFIGURATION section at the top of this script: "
+                 "set BMC_URL, BMC_USERNAME and BMC_PASSWORD.")
     if not host.lower().startswith(("http://", "https://")):
         host = "https://" + host
-    username = (args.username or setting("BMC_USERNAME")
-                or input("Remedy username: ")).strip()
-    if not username:
-        sys.exit("A Remedy username is required.")
-    password = setting("BMC_PASSWORD") or getpass.getpass("Remedy password: ")
-    prefix = setting("BMC_PREFIX")
-    prefix_field = setting("BMC_PREFIX_FIELD")
-    detect_field = setting("BMC_DETECT_FIELD")
-    ctx = ssl_context(setting("BMC_VERIFY_TLS").lower() != "false")
-    tz = resolve_timezone(setting("BMC_TIMEZONE"))
-    print(f"Connecting to {host} as {username}")
+    if not password or password == "your_password":
+        password = getpass.getpass(f"Remedy password for {username}: ")
+
+    prefix = INCIDENT_PREFIX
+    prefix_field = PREFIX_FIELD
+    detect_field = DETECT_FIELD
+    ctx = ssl_context(VERIFY_TLS)
+    tz = resolve_timezone(TIMEZONE)
 
     months = sorted(set(args.months))
     if any(m < 1 or m > 12 for m in months):
-        sys.exit("--months must be between 1 and 12.")
+        sys.exit("MONTHS must be between 1 and 12.")
     output = args.output or (f"{prefix}_incident_mttr_report_"
                              f"{datetime.now():%Y%m%d_%H%M%S}.csv")
+    print(f"Connecting to {host} as {username}")
 
     fields = ["Incident Number", "Description", "Status", "Priority",
               "Submit Date", "Last Resolved Date", detect_field]
