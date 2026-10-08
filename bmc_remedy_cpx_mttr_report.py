@@ -15,8 +15,12 @@ BMC_PASSWORD = "your_password"
 # Report options.
 YEAR = 2026                      # year to report on
 MONTHS = [7, 8, 9]               # July, August, September
-INCIDENT_PREFIX = "CPX"          # incidents whose number starts with this
-PREFIX_FIELD = "Incident Number" # field the prefix is matched on
+# Which incidents to include: those whose PREFIX_FIELD starts with
+# INCIDENT_PREFIX. PREFIX_FIELD must be a Remedy *field name*, e.g.
+#   "Incident Number"  -> the INC/CPX number
+#   "Description"      -> the incident Summary
+INCIDENT_PREFIX = "CPX"          # text the field value starts with
+PREFIX_FIELD = "Incident Number" # field name to search in
 DETECT_FIELD = "Reported Date"   # Time to Detect = Submit Date - this field
 TIMEZONE = ""                    # e.g. "+05:30"; "" = this machine's time zone
 VERIFY_TLS = True                # False if the server uses a self-signed cert
@@ -102,6 +106,13 @@ def http(method, url, ctx, headers=None, data=None, timeout=120):
             return resp.read().decode("utf-8")
     except urllib.error.HTTPError as err:
         detail = err.read().decode("utf-8", "replace")
+        if '"messageNumber":1587' in detail.replace(" ", ""):
+            detail += ("\n\nHint: a field name in the query does not exist on "
+                       "HPD:Help Desk. Check PREFIX_FIELD and DETECT_FIELD in "
+                       "the CONFIGURATION section - they must be field names "
+                       "(e.g. \"Incident Number\", \"Description\"), not the "
+                       "text you are searching for, which goes in "
+                       "INCIDENT_PREFIX.")
         sys.exit(f"Remedy returned HTTP {err.code} for {method} {url}\n{detail}")
     except urllib.error.URLError as err:
         sys.exit(f"Could not reach Remedy at {url}: {err.reason}")
@@ -154,11 +165,18 @@ def fetch_incidents(host, token, qualification, fields, ctx):
         offset += PAGE_SIZE
 
 
+def like_literal(text):
+    """Escape a value for a Remedy LIKE pattern: wildcards % _ [ become
+    literal by wrapping them in brackets, and double quotes are doubled."""
+    out = "".join(f"[{c}]" if c in "%_[" else c for c in text)
+    return out.replace('"', '""')
+
+
 def build_qualification(prefix_field, prefix, start, end):
     # Date fields are compared as epoch seconds, which avoids any dependence
     # on the server's date-format locale.
     return (
-        f"'{prefix_field}' LIKE \"{prefix}%\" "
+        f"'{prefix_field}' LIKE \"{like_literal(prefix)}%\" "
         f"AND 'Submit Date' >= {int(start.timestamp())} "
         f"AND 'Submit Date' < {int(end.timestamp())}"
     )
@@ -270,7 +288,7 @@ def summarise(label, subset):
             blank(mttr), fmt_duration(mttr), blank(mttd), fmt_duration(mttd)], mttr
 
 
-def write_report(rows, months, year, detect_field, prefix, path):
+def write_report(rows, months, year, detect_field, prefix, prefix_field, path):
     # utf-8-sig adds a BOM so Excel detects the encoding correctly.
     with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
@@ -301,7 +319,7 @@ def write_report(rows, months, year, detect_field, prefix, path):
         w.writerow(line)
 
         w.writerow([])
-        w.writerow([f"Incidents whose Incident Number starts with \"{prefix}\", "
+        w.writerow([f"Incidents whose {prefix_field} starts with \"{prefix}\", "
                     f"filtered on Submit Date."])
         w.writerow([f"Time to Detect = Submit Date - {detect_field}; "
                     f"Time to Resolve = Last Resolved Date - Submit Date."])
@@ -348,7 +366,8 @@ def main():
     months = sorted(set(args.months))
     if any(m < 1 or m > 12 for m in months):
         sys.exit("MONTHS must be between 1 and 12.")
-    output = args.output or (f"{prefix}_incident_mttr_report_"
+    safe_prefix = re.sub(r"[^A-Za-z0-9]+", "_", prefix).strip("_") or "incident"
+    output = args.output or (f"{safe_prefix}_incident_mttr_report_"
                              f"{datetime.now():%Y%m%d_%H%M%S}.csv")
     print(f"Connecting to {host} as {username}")
 
@@ -373,7 +392,7 @@ def main():
 
     rows = build_rows(entries, detect_field, tz)
     overall_mttr = write_report(rows, months, args.year, detect_field,
-                                prefix, output)
+                                prefix, prefix_field, output)
 
     print(f"\n{len(rows)} {prefix} incident(s) found.")
     print(f"Average MTTR: {fmt_duration(overall_mttr) or 'n/a'}"
