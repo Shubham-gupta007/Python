@@ -15,16 +15,17 @@ BMC_PASSWORD = "your_password"
 # Report options.
 YEAR = 2026                      # year to report on
 MONTHS = [7, 8, 9]               # July, August, September
-# Which incidents to include: those whose PREFIX_FIELD starts with
-# INCIDENT_PREFIX. PREFIX_FIELD must be a Remedy *field name*, e.g.
+# Which incidents to include: those whose PREFIX_FIELD starts with ANY of
+# the INCIDENT_PREFIXES. Add as many as you need, each in quotes, separated
+# by commas. PREFIX_FIELD must be a Remedy *field name*, e.g.
 #   "Incident Number"  -> the INC/CPX number
 #   "Description"      -> the incident Summary
-INCIDENT_PREFIX = "CPX"          # text the field value starts with
+INCIDENT_PREFIXES = ["CPX"]      # e.g. ["CPX | ID:", "CPY | ID:", "ABC"]
 PREFIX_FIELD = "Incident Number" # field name to search in
 DETECT_FIELD = "Reported Date"   # Time to Detect = Submit Date - this field
 TIMEZONE = ""                    # e.g. "+05:30"; "" = this machine's time zone
 VERIFY_TLS = True                # False if the server uses a self-signed cert
-OUTPUT_FILE = ""                 # "" = CPX_incident_mttr_report_<timestamp>.csv
+OUTPUT_FILE = ""                 # "" = incident_mttr_report_<timestamp>.csv
 
 # =========================================================================== #
 #                     Nothing below needs to be changed.                      #
@@ -112,7 +113,7 @@ def http(method, url, ctx, headers=None, data=None, timeout=120):
                        "the CONFIGURATION section - they must be field names "
                        "(e.g. \"Incident Number\", \"Description\"), not the "
                        "text you are searching for, which goes in "
-                       "INCIDENT_PREFIX.")
+                       "INCIDENT_PREFIXES.")
         sys.exit(f"Remedy returned HTTP {err.code} for {method} {url}\n{detail}")
     except urllib.error.URLError as err:
         sys.exit(f"Could not reach Remedy at {url}: {err.reason}")
@@ -172,11 +173,14 @@ def like_literal(text):
     return out.replace('"', '""')
 
 
-def build_qualification(prefix_field, prefix, start, end):
+def build_qualification(prefix_field, prefixes, start, end):
+    # One LIKE per prefix, OR-ed together, so a single query covers them all.
     # Date fields are compared as epoch seconds, which avoids any dependence
     # on the server's date-format locale.
+    likes = " OR ".join(f"'{prefix_field}' LIKE \"{like_literal(p)}%\""
+                        for p in prefixes)
     return (
-        f"'{prefix_field}' LIKE \"{like_literal(prefix)}%\" "
+        f"({likes}) "
         f"AND 'Submit Date' >= {int(start.timestamp())} "
         f"AND 'Submit Date' < {int(end.timestamp())}"
     )
@@ -258,14 +262,28 @@ def average(values):
 # Report
 # --------------------------------------------------------------------------- #
 
-def build_rows(entries, detect_field, tz):
+def matched_prefix(value, prefixes):
+    """Longest configured prefix the value starts with (case-insensitive,
+    like Remedy's LIKE on most databases)."""
+    value = (value or "").casefold()
+    hits = [p for p in prefixes if value.startswith(p.casefold())]
+    return max(hits, key=len) if hits else ""
+
+
+def build_rows(entries, detect_field, prefix_field, prefixes, tz):
     rows = []
+    seen = set()
     for e in entries:
+        key = e.get("Incident Number")
+        if key in seen:
+            continue
+        seen.add(key)
         reported = parse_remedy_date(e.get(detect_field), tz)
         submitted = parse_remedy_date(e.get("Submit Date"), tz)
         resolved = parse_remedy_date(e.get("Last Resolved Date"), tz)
         rows.append({
             "incident": e.get("Incident Number") or "",
+            "prefix": matched_prefix(e.get(prefix_field), prefixes),
             "summary": e.get("Description") or "",
             "status": e.get("Status") or "",
             "priority": e.get("Priority") or "",
@@ -288,18 +306,19 @@ def summarise(label, subset):
             blank(mttr), fmt_duration(mttr), blank(mttd), fmt_duration(mttd)], mttr
 
 
-def write_report(rows, months, year, detect_field, prefix, prefix_field, path):
+def write_report(rows, months, year, detect_field, prefixes, prefix_field,
+                 path):
     # utf-8-sig adds a BOM so Excel detects the encoding correctly.
     with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
 
-        w.writerow(["Incident Number", "Summary", "Status", "Priority", "Month",
+        w.writerow(["Incident Number", "Matched Prefix", "Summary", "Status", "Priority", "Month",
                     detect_field, "Submit Date", "Last Resolved Date",
                     "Time to Detect (hrs)", "Time to Detect (d hh:mm)",
                     "Time to Resolve (hrs)", "Time to Resolve (d hh:mm)"])
         for r in rows:
-            w.writerow([r["incident"], r["summary"], r["status"], r["priority"],
-                        r["month"], fmt_date(r["reported"]),
+            w.writerow([r["incident"], r["prefix"], r["summary"], r["status"],
+                        r["priority"], r["month"], fmt_date(r["reported"]),
                         fmt_date(r["submitted"]), fmt_date(r["resolved"]),
                         blank(r["ttd"]), fmt_duration(r["ttd"]),
                         blank(r["ttr"]), fmt_duration(r["ttr"])])
@@ -318,9 +337,21 @@ def write_report(rows, months, year, detect_field, prefix, prefix_field, path):
         line, overall_mttr = summarise(overall_label, rows)
         w.writerow(line)
 
+        if len(prefixes) > 1:
+            w.writerow([])
+            w.writerow(["SUMMARY BY PREFIX"])
+            w.writerow(["Prefix", "Total Incidents", "Resolved",
+                        "Open / Unresolved", "Average MTTR (hrs)",
+                        "Average MTTR (d hh:mm)",
+                        "Average Time to Detect (hrs)",
+                        "Average Time to Detect (d hh:mm)"])
+            for p in prefixes:
+                w.writerow(summarise(p, [r for r in rows if r["prefix"] == p])[0])
+
         w.writerow([])
-        w.writerow([f"Incidents whose {prefix_field} starts with \"{prefix}\", "
-                    f"filtered on Submit Date."])
+        quoted = ", ".join(f'"{p}"' for p in prefixes)
+        w.writerow([f"Incidents whose {prefix_field} starts with any of: "
+                    f"{quoted}; filtered on Submit Date."])
         w.writerow([f"Time to Detect = Submit Date - {detect_field}; "
                     f"Time to Resolve = Last Resolved Date - Submit Date."])
         w.writerow(["MTTR averages resolved incidents only; open incidents "
@@ -334,7 +365,7 @@ def write_report(rows, months, year, detect_field, prefix, prefix_field, path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="BMC Remedy CPX incident MTTR report (CSV). "
+        description="BMC Remedy incident MTTR report (CSV). "
                     "Values come from the CONFIGURATION section at the top "
                     "of this file; these options override them for one run.")
     parser.add_argument("--year", type=int, default=YEAR,
@@ -357,7 +388,12 @@ def main():
     if not password or password == "your_password":
         password = getpass.getpass(f"Remedy password for {username}: ")
 
-    prefix = INCIDENT_PREFIX
+    prefixes = INCIDENT_PREFIXES
+    if isinstance(prefixes, str):
+        prefixes = [prefixes]
+    prefixes = list(dict.fromkeys(p for p in prefixes if p and p.strip()))
+    if not prefixes:
+        sys.exit("INCIDENT_PREFIXES is empty - add at least one prefix.")
     prefix_field = PREFIX_FIELD
     detect_field = DETECT_FIELD
     ctx = ssl_context(VERIFY_TLS)
@@ -366,13 +402,15 @@ def main():
     months = sorted(set(args.months))
     if any(m < 1 or m > 12 for m in months):
         sys.exit("MONTHS must be between 1 and 12.")
-    safe_prefix = re.sub(r"[^A-Za-z0-9]+", "_", prefix).strip("_") or "incident"
-    output = args.output or (f"{safe_prefix}_incident_mttr_report_"
+    output = args.output or (f"incident_mttr_report_"
                              f"{datetime.now():%Y%m%d_%H%M%S}.csv")
     print(f"Connecting to {host} as {username}")
+    print(f"Prefixes on '{prefix_field}': " + ", ".join(prefixes))
 
     fields = ["Incident Number", "Description", "Status", "Priority",
               "Submit Date", "Last Resolved Date", detect_field]
+    if prefix_field not in fields:
+        fields.append(prefix_field)
 
     token = login(host, username, password, ctx)
     try:
@@ -384,17 +422,19 @@ def main():
             print(f"Querying {calendar.month_name[m]} {args.year}...")
             entries.extend(fetch_incidents(
                 host, token,
-                build_qualification(prefix_field, prefix, start, end),
+                build_qualification(prefix_field, prefixes, start, end),
                 fields, ctx,
             ))
     finally:
         logout(host, token, ctx)
 
-    rows = build_rows(entries, detect_field, tz)
+    rows = build_rows(entries, detect_field, prefix_field, prefixes, tz)
     overall_mttr = write_report(rows, months, args.year, detect_field,
-                                prefix, prefix_field, output)
+                                prefixes, prefix_field, output)
 
-    print(f"\n{len(rows)} {prefix} incident(s) found.")
+    print(f"\n{len(rows)} incident(s) found.")
+    for p in prefixes:
+        print(f'  "{p}" -> {sum(1 for r in rows if r["prefix"] == p)}')
     print(f"Average MTTR: {fmt_duration(overall_mttr) or 'n/a'}"
           + (f" ({overall_mttr} hrs)" if overall_mttr is not None else ""))
     print(f"Report written to {output}")
