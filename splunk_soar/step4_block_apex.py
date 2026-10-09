@@ -136,6 +136,18 @@ def block_apex(ioc_type=None, value=None, note=None, **kwargs):
 
     outputs = {"success": False, "detail": ""}
 
+    def _scalar(v):
+        # SOAR data paths often resolve to a single-item list even for
+        # one value (e.g. value=['https://evil.example.com/x']) - unwrap
+        # it so downstream code always sees a plain string.
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+
+    ioc_type = _scalar(ioc_type)
+    value = _scalar(value)
+    note = _scalar(note)
+
     try:
         payload = build_apex_payload(ioc_type, value, note or "Blocked via SOAR playbook")
         request_body = compact_json(payload)

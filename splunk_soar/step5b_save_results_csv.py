@@ -61,6 +61,11 @@ def save_results_csv(result_rows_json=None, filename=None, **kwargs):
         writer.writerows(rows)
         csv_text = buffer.getvalue()
 
+        if isinstance(filename, list):
+            # SOAR data paths often resolve to a single-item list even
+            # for one value - unwrap it so the filename is a plain string.
+            filename = filename[0] if filename else None
+
         output_name = filename or "ioc_results.csv"
         local_path = f"/opt/phantom/vault/tmp/{output_name}"
 

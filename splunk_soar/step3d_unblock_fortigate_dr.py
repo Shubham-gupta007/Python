@@ -139,7 +139,31 @@ def unblock_fortigate_dr(ioc_type=None, value=None, **kwargs):
 
     outputs = {"success": False, "detail": ""}
 
+    def _scalar(v):
+        # SOAR data paths often resolve to a single-item list even for
+        # one value (e.g. value=['185.136.15.66']) - unwrap it so
+        # downstream code always sees a plain string.
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+
+    ioc_type = _scalar(ioc_type)
+    value = _scalar(value)
+
     try:
+        if not FORTIGATE_HOST or not FORTIGATE_API_KEY:
+            outputs["detail"] = (
+                "[DR] Not configured: FORTIGATE_DR_HOST and/or FORTIGATE_DR_API_KEY "
+                "is empty."
+            )
+            assert json.dumps(outputs)
+            return outputs
+
+        if not value:
+            outputs["detail"] = "[DR] No 'value' provided."
+            assert json.dumps(outputs)
+            return outputs
+
         group = FORTIGATE_IP_GROUP if ioc_type == "IP" else FORTIGATE_DOMAIN_GROUP
         group_success, group_detail = fortigate_remove_from_group(group, value)
 
@@ -151,7 +175,7 @@ def unblock_fortigate_dr(ioc_type=None, value=None, **kwargs):
             outputs["detail"] = f"[DR] {group_detail}, {delete_detail}"
 
     except Exception as error:
-        outputs["detail"] = f"Exception: {error}"
+        outputs["detail"] = f"[DR] {FORTIGATE_HOST}: Exception ({type(error).__name__}): {error}"
 
     # Return a JSON-serializable object
     assert json.dumps(outputs)  # Will raise an exception if the :outputs: object is not JSON-serializable

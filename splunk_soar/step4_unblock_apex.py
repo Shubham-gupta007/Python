@@ -114,6 +114,17 @@ def unblock_apex(ioc_type=None, value=None, **kwargs):
 
     outputs = {"success": False, "detail": ""}
 
+    def _scalar(v):
+        # SOAR data paths often resolve to a single-item list even for
+        # one value - unwrap it so downstream code always sees a plain
+        # string.
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+
+    ioc_type = _scalar(ioc_type)
+    value = _scalar(value)
+
     try:
         payload = build_apex_unblock_payload(ioc_type, value)
         request_body = compact_json(payload)

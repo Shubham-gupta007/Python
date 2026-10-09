@@ -54,6 +54,11 @@ def read_ioc_file(vault_id=None, **kwargs):
 
     outputs = {"iocs_json": "[]", "ioc_count": 0, "error": ""}
 
+    if isinstance(vault_id, list):
+        # SOAR data paths often resolve to a single-item list even for
+        # one value - unwrap it so downstream code sees a plain string.
+        vault_id = vault_id[0] if vault_id else None
+
     if not vault_id:
         outputs["error"] = "No vault_id provided."
         assert json.dumps(outputs)

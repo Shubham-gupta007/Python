@@ -70,6 +70,17 @@ def block_fortigate_dr_ip(value=None, comment=None, **kwargs):
 
     outputs = {"success": False, "detail": ""}
 
+    def _scalar(v):
+        # SOAR data paths often resolve to a single-item list even for
+        # one value (e.g. value=['185.136.15.66']) - unwrap it so
+        # downstream code always sees a plain string.
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+
+    value = _scalar(value)
+    comment = _scalar(comment)
+
     if not FORTIGATE_HOST or not FORTIGATE_API_KEY:
         outputs["detail"] = (
             f"{TAG} Not configured: FORTIGATE_DR_HOST and/or FORTIGATE_DR_API_KEY "

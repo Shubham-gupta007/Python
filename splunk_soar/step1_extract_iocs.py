@@ -110,6 +110,12 @@ def extract_iocs(advisory_text=None, **kwargs):
 
     outputs = {"iocs_json": "[]", "ioc_count": 0}
 
+    if isinstance(advisory_text, list):
+        # SOAR data paths can resolve to a list of text chunks rather
+        # than one string - join them instead of only scanning the
+        # first, so no part of the advisory is silently skipped.
+        advisory_text = "\n".join(str(chunk) for chunk in advisory_text if chunk)
+
     text = refang_text(advisory_text or "")
 
     urls = extract_urls(text)
