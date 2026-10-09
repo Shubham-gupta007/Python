@@ -4,7 +4,7 @@ Splunk SOAR Custom Function - Step 3d (undo): Unblock one IP/DOMAIN on FortiGate
 
 The DR counterpart to step3c_unblock_fortigate_dc.py - identical
 except it reads FORTIGATE_DR_* credentials. Unblock anything
-step3b_block_fortigate_dr.py blocked.
+step3b1_block_fortigate_dr_ip.py / step3b2_block_fortigate_dr_domain.py blocked.
 
 No external libraries - uses urllib/ssl/json from the standard library.
 
@@ -17,7 +17,7 @@ How to use in SOAR:
     4. Paste everything from "import json" below into the editor.
 
 Credentials: same FORTIGATE_DR_* environment variables as
-step3b_block_fortigate_dr.py.
+step3b1_block_fortigate_dr_ip.py / step3b2_block_fortigate_dr_domain.py.
 """
 
 

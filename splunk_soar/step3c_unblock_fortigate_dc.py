@@ -6,7 +6,7 @@ Removes the address object from its block group, then deletes the
 address object outright. An IOC that was never blocked (already
 absent) counts as a success, since the desired end state already
 holds. The DC counterpart to step3d_unblock_fortigate_dr.py - unblock
-anything step3a_block_fortigate_dc.py blocked.
+anything step3a1_block_fortigate_dc_ip.py / step3a2_block_fortigate_dc_domain.py blocked.
 
 No external libraries - uses urllib/ssl/json from the standard library
 instead of the "requests" package.
@@ -20,7 +20,7 @@ How to use in SOAR:
     4. Paste everything from "import json" below into the editor.
 
 Credentials: same FORTIGATE_DC_* environment variables as
-step3a_block_fortigate_dc.py.
+step3a1_block_fortigate_dc_ip.py / step3a2_block_fortigate_dc_domain.py.
 """
 
 

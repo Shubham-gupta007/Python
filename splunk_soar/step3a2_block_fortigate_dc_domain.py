@@ -1,55 +1,40 @@
 #!/usr/bin/env python3
 """
-Splunk SOAR Custom Function - Step 3a: Block one IP/DOMAIN on FortiGate DC
+Splunk SOAR Custom Function - Step 3a2: Block one DOMAIN on FortiGate DC
 
-Identical in every way to step3b_block_fortigate_dr.py except which
-site's credentials it reads (FORTIGATE_DC_* here, FORTIGATE_DR_* in
-the DR version) - kept as two separate files/custom functions so your
-playbook shows "Block on DC" and "Block on DR" as distinct,
-individually retryable blocks that BOTH run for every IP/DOMAIN (not
-either/or) - the same dual-site behavior ioc_blocker.py's CLI tool has.
+DOMAIN-only counterpart to step3a1_block_fortigate_dc_ip.py - split out
+so your playbook can wire DOMAIN indicators straight to this block and
+IP indicators straight to the other one, with no ioc_type branching
+needed, and so error logs are unambiguous about both site AND type.
 
-No external libraries - uses urllib/ssl/json from the standard library
-instead of the "requests" package, since that isn't guaranteed to be
-importable inside SOAR's custom function sandbox.
+Every return path is tagged "[DC-DOMAIN]" - including the catch-all
+exception handler, which previously had no tag at all and could look
+identical to a failure from the DR block when eyeballing logs.
 
---------------------------------------------------------------------
-Before writing this as a custom function: Splunk's own FortiGate app
-(Splunkbase app id 5898) has native "block ip" / "unblock ip" actions
-- use those for plain IP blocking if your policy design fits how it
-works. It does NOT use a shared address group the way this script
-does - it creates a one-off "Phantom Addr [ip]_[bits]" object and
-edits a specific policy's destination address directly. If you want
-every blocked IOC visible in one reusable address group, or you need
-DOMAIN blocking (which the native app doesn't support at all), keep
-using this custom function instead.
---------------------------------------------------------------------
+No external libraries - uses urllib/ssl/json from the standard library.
 
 How to use in SOAR:
 
     1. Playbook editor -> Custom Function -> New Custom Function,
-       name it "block_fortigate_dc".
-    2. Input parameters: ioc_type (string), value (string),
-       comment (string)
+       name it "block_fortigate_dc_domain".
+    2. Input parameters: value (string), comment (string)
     3. Output parameters: success (boolean), detail (string)
     4. Paste everything from "import json" below into the editor.
-    5. In the playbook, wire this block to run in parallel with
-       step3b (DR) for every IP/DOMAIN - both should fire, not
-       either/or, so DC and DR end up with the same block.
+    5. Wire only DOMAIN-typed indicators into this block; wire IP ones
+       to step3a1_block_fortigate_dc_ip.py instead.
 
 Credentials: reads FORTIGATE_DC_HOST / FORTIGATE_DC_API_KEY /
-FORTIGATE_DC_VDOM / FORTIGATE_DC_IP_GROUP / FORTIGATE_DC_DOMAIN_GROUP
-from environment variables by default (handy for local testing). In
-SOAR, prefer pulling these from a configured Asset instead - see the
-commented block near the bottom of the function for the swap-in.
+FORTIGATE_DC_VDOM / FORTIGATE_DC_DOMAIN_GROUP / FORTIGATE_DC_VERIFY_TLS
+from environment variables by default. In SOAR, prefer pulling these
+from a configured Asset - see the commented block near the bottom of
+the function.
 """
 
 
-def block_fortigate_dc(ioc_type=None, value=None, comment=None, **kwargs):
+def block_fortigate_dc_domain(value=None, comment=None, **kwargs):
     """
     Args:
-        ioc_type (CEF type: string) -- "IP" or "DOMAIN"
-        value (CEF type: string)
+        value (CEF type: domain) -- the domain/FQDN to block
         comment (CEF type: string)
 
     Returns a JSON-serializable object that implements the configured data paths:
@@ -57,7 +42,6 @@ def block_fortigate_dc(ioc_type=None, value=None, comment=None, **kwargs):
         detail (CEF type: string)
     """
     ########################## Custom Code Goes Below This Line ##########################
-    import ipaddress
     import json
     import os
     import ssl
@@ -65,21 +49,36 @@ def block_fortigate_dc(ioc_type=None, value=None, comment=None, **kwargs):
     import urllib.parse
     import urllib.request
 
+    TAG = "[DC-DOMAIN]"
+
     FORTIGATE_HOST = os.environ.get("FORTIGATE_DC_HOST", "")
     FORTIGATE_API_KEY = os.environ.get("FORTIGATE_DC_API_KEY", "")
     FORTIGATE_VDOM = os.environ.get("FORTIGATE_DC_VDOM", "root")
-    FORTIGATE_IP_GROUP = os.environ.get("FORTIGATE_DC_IP_GROUP", "Blocked-IPs")
     FORTIGATE_DOMAIN_GROUP = os.environ.get("FORTIGATE_DC_DOMAIN_GROUP", "Blocked-Domains")
     FORTIGATE_VERIFY_TLS = os.environ.get("FORTIGATE_DC_VERIFY_TLS", "false").lower() == "true"
 
-    # ---- SOAR-asset version of the credentials (recommended for
-    # production instead of environment variables) ----
+    # ---- SOAR-asset version of the credentials ----
     # asset_config = phantom.get_asset_config("fortigate_dc")
     # FORTIGATE_HOST = asset_config["fortigate_host"]
     # FORTIGATE_API_KEY = asset_config["api_key"]
 
     FORTIGATE_ADDRESS_PATH = "/api/v2/cmdb/firewall/address"
     FORTIGATE_GROUP_PATH = "/api/v2/cmdb/firewall/addrgrp"
+
+    outputs = {"success": False, "detail": ""}
+
+    if not FORTIGATE_HOST or not FORTIGATE_API_KEY:
+        outputs["detail"] = (
+            f"{TAG} Not configured: FORTIGATE_DC_HOST and/or FORTIGATE_DC_API_KEY "
+            "is empty. Set both before blocking domains on the DC firewall."
+        )
+        assert json.dumps(outputs)
+        return outputs
+
+    if not value:
+        outputs["detail"] = f"{TAG} No 'value' (domain) provided."
+        assert json.dumps(outputs)
+        return outputs
 
     class HttpResponse:
         def __init__(self, status_code, text):
@@ -117,22 +116,11 @@ def block_fortigate_dc(ioc_type=None, value=None, comment=None, **kwargs):
         except urllib.error.URLError as error:
             return HttpResponse(0, str(error.reason))
 
-    def fortigate_normalize_subnet(ip_value):
-        network = ipaddress.ip_network(ip_value, strict=False)
-        return f"{network.network_address} {network.netmask}"
-
-    def build_fortigate_payload(ioc_type, value, comment):
-        if ioc_type == "IP":
-            return {
-                "name": value,
-                "type": "ipmask",
-                "subnet": fortigate_normalize_subnet(value),
-                "comment": comment or "",
-            }
+    def build_address_payload(domain_value, comment):
         return {
-            "name": value,
+            "name": domain_value,
             "type": "fqdn",
-            "fqdn": value,
+            "fqdn": domain_value,
             "comment": comment or "",
         }
 
@@ -181,10 +169,8 @@ def block_fortigate_dc(ioc_type=None, value=None, comment=None, **kwargs):
 
         return False, f"HTTP {response.status_code} - could not update group '{group_name}'"
 
-    outputs = {"success": False, "detail": ""}
-
     try:
-        payload = build_fortigate_payload(ioc_type, value, comment or "")
+        payload = build_address_payload(value, comment or "")
         success, response = fortigate_create_or_update_address(payload)
 
         if not success:
@@ -192,17 +178,19 @@ def block_fortigate_dc(ioc_type=None, value=None, comment=None, **kwargs):
                 body = response.json()
             except ValueError:
                 body = response.text
-            outputs["detail"] = f"[DC] HTTP {response.status_code} - address object failed: {body}"
+            outputs["detail"] = (
+                f"{TAG} {FORTIGATE_HOST}: HTTP {response.status_code} - address object failed: {body}"
+            )
         else:
-            group = FORTIGATE_IP_GROUP if ioc_type == "IP" else FORTIGATE_DOMAIN_GROUP
-            group_success, group_detail = fortigate_add_to_group(group, value)
-            address_type = "ipmask" if ioc_type == "IP" else "fqdn"
-
+            group_success, group_detail = fortigate_add_to_group(FORTIGATE_DOMAIN_GROUP, value)
             outputs["success"] = group_success
-            outputs["detail"] = f"[DC] HTTP {response.status_code} - {address_type} address created/updated, {group_detail}"
+            outputs["detail"] = (
+                f"{TAG} {FORTIGATE_HOST}: HTTP {response.status_code} - "
+                f"fqdn address created/updated, {group_detail}"
+            )
 
     except Exception as error:
-        outputs["detail"] = f"Exception: {error}"
+        outputs["detail"] = f"{TAG} {FORTIGATE_HOST}: Exception ({type(error).__name__}): {error}"
 
     # Return a JSON-serializable object
     assert json.dumps(outputs)  # Will raise an exception if the :outputs: object is not JSON-serializable
