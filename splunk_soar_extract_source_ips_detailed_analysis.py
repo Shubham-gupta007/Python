@@ -49,6 +49,23 @@ _NEXT_SECTION_BOUNDARY = re.compile(
 )
 
 
+def as_text(value) -> str:
+    """
+    Normalize a SOAR datapath value to a plain string.
+
+    A wildcard CEF datapath (e.g. artifact:*.cef.detailed_analysis) hands the
+    custom function a LIST of strings, not a plain string, even when only one
+    artifact matches - passing that straight to re.sub()/re.search() raises
+    "expected string or bytes-like object, got list". Join list/tuple values
+    (covers multiple matching artifacts) and stringify anything else.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "\n".join(as_text(item) for item in value if item)
+    return str(value)
+
+
 def refang(text: str) -> str:
     if not text:
         return text
@@ -68,9 +85,9 @@ def isolate_detailed_analysis(text: str) -> str:
     return text
 
 
-def extract_source_ips_list(detailed_analysis_text: str):
+def extract_source_ips_list(detailed_analysis_text) -> list:
     """Pure function: deduped, order-preserving list of source IPs."""
-    text = isolate_detailed_analysis(refang(detailed_analysis_text or ""))
+    text = isolate_detailed_analysis(refang(as_text(detailed_analysis_text)))
 
     source_ips = []
     lines = text.splitlines()
@@ -176,5 +193,12 @@ IP:
     print("\nCase 3 (simple single-line format, generic across templates):")
     print(json.dumps(result3, indent=2))
     assert result3["source_ips"] == ["94.204.125.24"]
+
+    # Case 4: SOAR wildcard-datapath input arrives as a list, not a plain
+    # string - must not raise "expected string or bytes-like object, got list"
+    result4 = extract_source_ips(detailed_analysis=[detailed_analysis_only])
+    print("\nCase 4 (list input, as a wildcard CEF datapath produces):")
+    print(json.dumps(result4, indent=2))
+    assert result4["source_ip_count"] == 5
 
     print("\nAll cases passed.")
