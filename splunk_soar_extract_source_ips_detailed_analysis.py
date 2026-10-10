@@ -10,9 +10,11 @@ Recommendations / Description / Logs are never scanned, even if the whole
 combined alert text gets passed in by mistake.
 
 Works across alert templates (not hardcoded to one wording) by recognizing
-several common source-IP label shapes:
+several common source-IP label shapes, case-insensitively and with or
+without a space before "IP":
   - "Source IP :", "Source IPs :", "Source IPs Observed :"
-  - "Attacker IP(s) :", "Malicious IP(s) :"
+  - "SourceIP :", "SOURCEIP :", "sourceip :", "Source ips :"
+  - "Attacker IP(s) :", "Malicious IP(s) :" (same spacing/casing flexibility)
   - a bare "IP :" heading (used by some templates to list each source IP's
     reputation one at a time, e.g. "IP: \\n1.2.3.4 ISP: ...")
 and both layouts: IP(s) inline on the label line, or one IP per line
@@ -40,7 +42,7 @@ import re
 IPV4 = r"(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)"
 
 _SOURCE_LABEL = re.compile(
-    r"(?<![A-Za-z])(?:Source\s+IPs?(?:\s+Observed)?|Attacker\s+IPs?|Malicious\s+IPs?|IP)\s*:",
+    r"(?<![A-Za-z])(?:Source\s*IPs?(?:\s+Observed)?|Attacker\s*IPs?|Malicious\s*IPs?|IP)\s*:",
     re.IGNORECASE,
 )
 _DETAILED_ANALYSIS_HEADER = re.compile(r"Detailed\s+analysis\s*:", re.IGNORECASE)
@@ -200,5 +202,15 @@ IP:
     print("\nCase 4 (list input, as a wildcard CEF datapath produces):")
     print(json.dumps(result4, indent=2))
     assert result4["source_ip_count"] == 5
+
+    # Case 5: label spacing/casing variants - "SourceIP", "SOURCEIP",
+    # "sourceip", "Source ips" must all be recognized, not just "Source IP".
+    for label in ("SourceIP", "SOURCEIP", "sourceip", "Source ips", "Source IPs Observed"):
+        variant_text = f"{label}: 203.0.113.5, 203.0.113.6\n"
+        variant_result = extract_source_ips(detailed_analysis=variant_text)
+        assert variant_result["source_ips"] == ["203.0.113.5", "203.0.113.6"], (
+            f"label variant {label!r} failed: {variant_result}"
+        )
+    print("\nCase 5 (label spacing/casing variants - SourceIP/SOURCEIP/sourceip/etc.) passed.")
 
     print("\nAll cases passed.")
