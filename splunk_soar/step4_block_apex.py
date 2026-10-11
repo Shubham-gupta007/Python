@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 """
-Splunk SOAR Custom Function - Step 4: Block one URL/SHA1/SHA256 on
+Splunk SOAR Custom Function - Step 4: Block URL(s)/SHA1(s)/SHA256(s) on
 Trend Micro Apex Central
 
-Takes an already-validated URL, SHA1 or SHA256 from step 2 (only call
-this when step2's target_tool == "APEX") and adds it as a blocked
-User-Defined Suspicious Object (UDSO).
+Takes already-validated URL, SHA1 or SHA256 value(s) (only call this
+when step2's target_tool == "APEX") and adds each as a blocked
+User-Defined Suspicious Object (UDSO). Accepts EITHER a single value
+OR a list of values in "value" - a single value is just treated as a
+batch of one. ioc_type applies to the whole batch (it's one Apex
+Central content type per call - URL, SHA1 or SHA256).
+
+Every value needs its own signed JWT (the checksum covers that exact
+request body) and its own PUT call - Apex Central's UDSO API has no
+bulk endpoint, so a batch here is still N independent calls, just
+issued from one custom function invocation instead of N playbook
+blocks.
 
 There is no native Splunk SOAR app for Apex Central UDSO blocking -
 the official "Trend Micro Apex One" app (Splunkbase app id 5976) only
-covers endpoint quarantine actions, a different use case. This custom
-function's signed-JWT REST call is the way to do it.
+covers endpoint quarantine actions, a different use case.
 
 No external libraries - base64/hashlib/hmac/time/json build the JWT,
-and urllib/ssl make the HTTPS call, all standard library (no
-"requests" package needed).
+and urllib/ssl make the HTTPS call, all standard library.
 
 How to use in SOAR:
 
     1. Playbook editor -> Custom Function -> New Custom Function,
        name it "block_apex".
-    2. Input parameters: ioc_type (string), value (string),
-       note (string)
-    3. Output parameters: success (boolean), detail (string)
+    2. Input parameters: ioc_type (string), value (string - accepts a
+       list too), note (string - accepts a list too)
+    3. Output parameters: success (boolean), detail (string),
+       results_json (string), success_count (numeric),
+       failed_count (numeric)
     4. Paste everything from "import base64" below into the editor.
 
 Credentials: reads APEX_CENTRAL_URL / APEX_APPLICATION_ID /
@@ -35,13 +44,17 @@ the bottom of the function.
 def block_apex(ioc_type=None, value=None, note=None, **kwargs):
     """
     Args:
-        ioc_type (CEF type: string) -- "URL", "SHA1" or "SHA256"
-        value (CEF type: string)
-        note (CEF type: string)
+        ioc_type (CEF type: string) -- "URL", "SHA1" or "SHA256", applies to the whole batch
+        value (CEF type: string) -- one value, or a list of them
+        note (CEF type: string) -- one note applied to every value, or
+            a list of per-value notes matching value's length
 
     Returns a JSON-serializable object that implements the configured data paths:
-        success (CEF type: boolean)
-        detail (CEF type: string)
+        success (CEF type: boolean) -- True only if every value in this call succeeded
+        detail (CEF type: string) -- one-line summary
+        results_json (CEF type: string) -- JSON array of {value, success, detail}
+        success_count (CEF type: numeric)
+        failed_count (CEF type: numeric)
     """
     ########################## Custom Code Goes Below This Line ##########################
     import base64
@@ -106,12 +119,12 @@ def block_apex(ioc_type=None, value=None, note=None, **kwargs):
 
         return signing_input + "." + base64url_encode(signature)
 
-    def build_apex_payload(ioc_type, value, note):
+    def build_apex_payload(ioc_type, value, item_note):
         return {
             "param": {
                 "type": APEX_TYPE_MAP[ioc_type],
                 "content": value,
-                "notes": note,
+                "notes": item_note,
                 "scan_action": SCAN_ACTION,
             }
         }
@@ -134,22 +147,8 @@ def block_apex(ioc_type=None, value=None, note=None, **kwargs):
         except urllib.error.URLError as error:
             return 0, str(error.reason)
 
-    outputs = {"success": False, "detail": ""}
-
-    def _scalar(v):
-        # SOAR data paths often resolve to a single-item list even for
-        # one value (e.g. value=['https://evil.example.com/x']) - unwrap
-        # it so downstream code always sees a plain string.
-        if isinstance(v, list):
-            return v[0] if v else None
-        return v
-
-    ioc_type = _scalar(ioc_type)
-    value = _scalar(value)
-    note = _scalar(note)
-
-    try:
-        payload = build_apex_payload(ioc_type, value, note or "Blocked via SOAR playbook")
+    def block_one(value, item_note):
+        payload = build_apex_payload(ioc_type, value, item_note or "Blocked via SOAR playbook")
         request_body = compact_json(payload)
 
         token = apex_create_jwt("PUT", APEX_API_PATH, request_body)
@@ -166,9 +165,7 @@ def block_apex(ioc_type=None, value=None, note=None, **kwargs):
         try:
             response_json = json.loads(response_text)
         except ValueError:
-            outputs["detail"] = f"HTTP {status_code} - non-JSON response from Apex Central"
-            assert json.dumps(outputs)
-            return outputs
+            return False, f"HTTP {status_code} - non-JSON response from Apex Central"
 
         meta = response_json.get("Meta", {})
         result = str(meta.get("Result", ""))
@@ -176,13 +173,83 @@ def block_apex(ioc_type=None, value=None, note=None, **kwargs):
         error_message = meta.get("ErrorMsg")
 
         if status_code == 200 and result == "1":
-            outputs["success"] = True
-            outputs["detail"] = f"HTTP {status_code} - added to Apex Central UDSO (block)"
-        else:
-            outputs["detail"] = f"HTTP {status_code} - ErrorCode={error_code} ErrorMsg={error_message}"
+            return True, f"HTTP {status_code} - added to Apex Central UDSO (block)"
 
-    except Exception as error:
-        outputs["detail"] = f"Exception: {error}"
+        return False, f"HTTP {status_code} - ErrorCode={error_code} ErrorMsg={error_message}"
+
+    outputs = {
+        "success": False,
+        "detail": "",
+        "results_json": "[]",
+        "success_count": 0,
+        "failed_count": 0,
+    }
+
+    def _scalar(v):
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+
+    def _to_list(v):
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        return [v]
+
+    ioc_type = _scalar(ioc_type)
+    values = [v for v in _to_list(value) if v]
+    notes = _to_list(note)
+
+    def note_for(index):
+        if not notes:
+            return ""
+        if len(notes) == len(values):
+            return notes[index] or ""
+        return notes[0] or ""
+
+    if not APEX_CENTRAL_URL or not APEX_APPLICATION_ID or not APEX_API_KEY:
+        outputs["detail"] = (
+            "Not configured: APEX_CENTRAL_URL / APEX_APPLICATION_ID / "
+            "APEX_API_KEY must all be set."
+        )
+        assert json.dumps(outputs)
+        return outputs
+
+    if not values:
+        outputs["detail"] = "No 'value' provided."
+        assert json.dumps(outputs)
+        return outputs
+
+    if ioc_type not in APEX_TYPE_MAP:
+        outputs["detail"] = f"Unsupported ioc_type '{ioc_type}'. Expected URL, SHA1 or SHA256."
+        assert json.dumps(outputs)
+        return outputs
+
+    item_results = []
+
+    for index, item_value in enumerate(values):
+        try:
+            success, detail = block_one(item_value, note_for(index))
+            item_results.append({"value": item_value, "success": success, "detail": detail})
+        except Exception as item_error:
+            item_results.append({
+                "value": item_value,
+                "success": False,
+                "detail": f"Exception ({type(item_error).__name__}): {item_error}",
+            })
+
+    success_count = sum(1 for r in item_results if r["success"])
+    failed_count = len(item_results) - success_count
+
+    outputs["results_json"] = json.dumps(item_results)
+    outputs["success_count"] = success_count
+    outputs["failed_count"] = failed_count
+    outputs["success"] = failed_count == 0 and success_count > 0
+    outputs["detail"] = (
+        f"{success_count}/{len(item_results)} {ioc_type} value(s) blocked on Apex Central"
+        + ("" if failed_count == 0 else f", {failed_count} failed (see results_json)")
+    )
 
     # Return a JSON-serializable object
     assert json.dumps(outputs)  # Will raise an exception if the :outputs: object is not JSON-serializable

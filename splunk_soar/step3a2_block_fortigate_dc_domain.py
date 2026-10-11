@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Splunk SOAR Custom Function - Step 3a2: Block one DOMAIN on FortiGate DC
+Splunk SOAR Custom Function - Step 3a2: Block DOMAIN(s) on FortiGate DC
 
-DOMAIN-only counterpart to step3a1_block_fortigate_dc_ip.py - split out
-so your playbook can wire DOMAIN indicators straight to this block and
-IP indicators straight to the other one, with no ioc_type branching
-needed, and so error logs are unambiguous about both site AND type.
+DOMAIN-only counterpart to step3a1_block_fortigate_dc_ip.py. Accepts
+EITHER a single domain string OR a list of domains in "value" - a
+single value is just treated as a batch of one, so you can wire this
+to one indicator or to an entire list straight from a CSV/advisory
+without changing anything.
 
-Every return path is tagged "[DC-DOMAIN]" - including the catch-all
-exception handler, which previously had no tag at all and could look
-identical to a failure from the DR block when eyeballing logs.
+Every domain gets its own address object (unavoidable), but the
+address-group membership update is batched into a single GET + a
+single PUT covering every domain in the call, instead of one GET+PUT
+per domain.
+
+Every return path is tagged "[DC-DOMAIN]", including per-item
+failures inside a batch and the catch-all exception handler.
 
 No external libraries - uses urllib/ssl/json from the standard library.
 
@@ -17,8 +22,11 @@ How to use in SOAR:
 
     1. Playbook editor -> Custom Function -> New Custom Function,
        name it "block_fortigate_dc_domain".
-    2. Input parameters: value (string), comment (string)
-    3. Output parameters: success (boolean), detail (string)
+    2. Input parameters: value (string - accepts a list too),
+       comment (string - accepts a list too)
+    3. Output parameters: success (boolean), detail (string),
+       results_json (string), success_count (numeric),
+       failed_count (numeric)
     4. Paste everything from "import json" below into the editor.
     5. Wire only DOMAIN-typed indicators into this block; wire IP ones
        to step3a1_block_fortigate_dc_ip.py instead.
@@ -34,12 +42,16 @@ the function.
 def block_fortigate_dc_domain(value=None, comment=None, **kwargs):
     """
     Args:
-        value (CEF type: domain) -- the domain/FQDN to block
-        comment (CEF type: string)
+        value (CEF type: domain) -- one domain/FQDN, or a list of them
+        comment (CEF type: string) -- one comment applied to every
+            domain, or a list of per-domain comments matching value's length
 
     Returns a JSON-serializable object that implements the configured data paths:
-        success (CEF type: boolean)
-        detail (CEF type: string)
+        success (CEF type: boolean) -- True only if every domain in this call succeeded
+        detail (CEF type: string) -- one-line summary
+        results_json (CEF type: string) -- JSON array of {value, success, detail}
+        success_count (CEF type: numeric)
+        failed_count (CEF type: numeric)
     """
     ########################## Custom Code Goes Below This Line ##########################
     import json
@@ -65,18 +77,30 @@ def block_fortigate_dc_domain(value=None, comment=None, **kwargs):
     FORTIGATE_ADDRESS_PATH = "/api/v2/cmdb/firewall/address"
     FORTIGATE_GROUP_PATH = "/api/v2/cmdb/firewall/addrgrp"
 
-    outputs = {"success": False, "detail": ""}
+    outputs = {
+        "success": False,
+        "detail": "",
+        "results_json": "[]",
+        "success_count": 0,
+        "failed_count": 0,
+    }
 
-    def _scalar(v):
-        # SOAR data paths often resolve to a single-item list even for
-        # one value (e.g. value=['evil.example.com']) - unwrap it so
-        # downstream code always sees a plain string.
+    def _to_list(v):
+        if v is None:
+            return []
         if isinstance(v, list):
-            return v[0] if v else None
-        return v
+            return v
+        return [v]
 
-    value = _scalar(value)
-    comment = _scalar(comment)
+    values = [v for v in _to_list(value) if v]
+    comments = _to_list(comment)
+
+    def comment_for(index):
+        if not comments:
+            return ""
+        if len(comments) == len(values):
+            return comments[index] or ""
+        return comments[0] or ""
 
     if not FORTIGATE_HOST or not FORTIGATE_API_KEY:
         outputs["detail"] = (
@@ -86,7 +110,7 @@ def block_fortigate_dc_domain(value=None, comment=None, **kwargs):
         assert json.dumps(outputs)
         return outputs
 
-    if not value:
+    if not values:
         outputs["detail"] = f"{TAG} No 'value' (domain) provided."
         assert json.dumps(outputs)
         return outputs
@@ -127,12 +151,12 @@ def block_fortigate_dc_domain(value=None, comment=None, **kwargs):
         except urllib.error.URLError as error:
             return HttpResponse(0, str(error.reason))
 
-    def build_address_payload(domain_value, comment):
+    def build_address_payload(domain_value, item_comment):
         return {
             "name": domain_value,
             "type": "fqdn",
             "fqdn": domain_value,
-            "comment": comment or "",
+            "comment": item_comment or "",
         }
 
     def fortigate_is_duplicate(response):
@@ -156,52 +180,118 @@ def block_fortigate_dc_domain(value=None, comment=None, **kwargs):
 
         return False, response
 
-    def fortigate_add_to_group(group_name, member_name):
+    def fortigate_get_group_members(group_name):
         url = f"{FORTIGATE_HOST}{FORTIGATE_GROUP_PATH}/{group_name}"
-
         response = http_request("GET", url, params={"vdom": FORTIGATE_VDOM})
 
         if response.status_code != 200:
-            return False, f"HTTP {response.status_code} - could not look up group '{group_name}'"
+            return None, f"HTTP {response.status_code} - could not look up group '{group_name}'"
 
         body = response.json()
         results = body.get("results", [])
-        existing_members = [m["name"] for m in results[0].get("member", [])] if results else []
+        existing = [m["name"] for m in results[0].get("member", [])] if results else []
+        return existing, None
 
-        if member_name in existing_members:
-            return True, f"already a member of group '{group_name}'"
-
-        payload = {"member": [{"name": m} for m in existing_members + [member_name]]}
-
+    def fortigate_set_group_members(group_name, members):
+        url = f"{FORTIGATE_HOST}{FORTIGATE_GROUP_PATH}/{group_name}"
+        payload = {"member": [{"name": m} for m in members]}
         response = http_request("PUT", url, params={"vdom": FORTIGATE_VDOM}, body=payload)
 
         if response.status_code == 200:
-            return True, f"added to group '{group_name}'"
+            return True, None
 
         return False, f"HTTP {response.status_code} - could not update group '{group_name}'"
 
-    try:
-        payload = build_address_payload(value, comment or "")
-        success, response = fortigate_create_or_update_address(payload)
+    item_results = []
 
-        if not success:
+    try:
+        address_ok = {}
+
+        for index, domain_value in enumerate(values):
             try:
-                body = response.json()
-            except ValueError:
-                body = response.text
-            outputs["detail"] = (
-                f"{TAG} {FORTIGATE_HOST}: HTTP {response.status_code} - address object failed: {body}"
-            )
-        else:
-            group_success, group_detail = fortigate_add_to_group(FORTIGATE_DOMAIN_GROUP, value)
-            outputs["success"] = group_success
-            outputs["detail"] = (
-                f"{TAG} {FORTIGATE_HOST}: HTTP {response.status_code} - "
-                f"fqdn address created/updated, {group_detail}"
-            )
+                payload = build_address_payload(domain_value, comment_for(index))
+                success, response = fortigate_create_or_update_address(payload)
+
+                if success:
+                    address_ok[domain_value] = True
+                    item_results.append({
+                        "value": domain_value,
+                        "success": None,
+                        "detail": f"HTTP {response.status_code} - fqdn address created/updated",
+                    })
+                else:
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        body = response.text
+                    address_ok[domain_value] = False
+                    item_results.append({
+                        "value": domain_value,
+                        "success": False,
+                        "detail": f"HTTP {response.status_code} - address object failed: {body}",
+                    })
+
+            except Exception as item_error:
+                address_ok[domain_value] = False
+                item_results.append({
+                    "value": domain_value,
+                    "success": False,
+                    "detail": f"Exception ({type(item_error).__name__}): {item_error}",
+                })
+
+        to_add = [v for v in values if address_ok.get(v)]
+
+        if to_add:
+            existing_members, group_error = fortigate_get_group_members(FORTIGATE_DOMAIN_GROUP)
+
+            if existing_members is None:
+                for result in item_results:
+                    if address_ok.get(result["value"]):
+                        result["success"] = False
+                        result["detail"] += f", {group_error}"
+            else:
+                new_members = existing_members + [v for v in to_add if v not in existing_members]
+
+                if set(new_members) != set(existing_members):
+                    group_success, group_set_error = fortigate_set_group_members(FORTIGATE_DOMAIN_GROUP, new_members)
+                else:
+                    group_success, group_set_error = True, None
+
+                for result in item_results:
+                    v = result["value"]
+                    if not address_ok.get(v):
+                        continue
+                    if group_success:
+                        already = v in existing_members
+                        result["success"] = True
+                        result["detail"] += (
+                            f", already a member of group '{FORTIGATE_DOMAIN_GROUP}'"
+                            if already
+                            else f", added to group '{FORTIGATE_DOMAIN_GROUP}'"
+                        )
+                    else:
+                        result["success"] = False
+                        result["detail"] += f", group update failed: {group_set_error}"
 
     except Exception as error:
         outputs["detail"] = f"{TAG} {FORTIGATE_HOST}: Exception ({type(error).__name__}): {error}"
+        assert json.dumps(outputs)
+        return outputs
+
+    for result in item_results:
+        result["detail"] = f"{TAG} {FORTIGATE_HOST}: {result['detail']}"
+
+    success_count = sum(1 for r in item_results if r["success"])
+    failed_count = len(item_results) - success_count
+
+    outputs["results_json"] = json.dumps(item_results)
+    outputs["success_count"] = success_count
+    outputs["failed_count"] = failed_count
+    outputs["success"] = failed_count == 0 and success_count > 0
+    outputs["detail"] = (
+        f"{TAG} {FORTIGATE_HOST}: {success_count}/{len(item_results)} domain(s) blocked"
+        + ("" if failed_count == 0 else f", {failed_count} failed (see results_json)")
+    )
 
     # Return a JSON-serializable object
     assert json.dumps(outputs)  # Will raise an exception if the :outputs: object is not JSON-serializable
