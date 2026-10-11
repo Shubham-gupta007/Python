@@ -41,10 +41,14 @@ import re
 
 IPV4 = r"(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)"
 
-_SOURCE_LABEL = re.compile(
-    r"(?<![A-Za-z])(?:Source\s*IPs?(?:\s+Observed)?|Attacker\s*IPs?|Malicious\s*IPs?|IP)\s*:",
+_STRONG_SOURCE_LABEL = re.compile(
+    r"(?<![A-Za-z])(?:Source\s*IPs?(?:\s+Observed)?|Attacker\s*IPs?|Malicious\s*IPs?)\s*:",
     re.IGNORECASE,
 )
+# Bare "IP:" is only a source label when it's the WHOLE thing at the start
+# of the line - "Destination IP:", "Dest IP:", "Target IP:", "Affected
+# Backend:" etc. must never match this (that was the destination-IP leak).
+_BARE_IP_LABEL = re.compile(r"^\s*IP\s*:", re.IGNORECASE)
 _DETAILED_ANALYSIS_HEADER = re.compile(r"Detailed\s+analysis\s*:", re.IGNORECASE)
 _NEXT_SECTION_BOUNDARY = re.compile(
     r"\*{5,}|^\s*(?:Recommendations|Description|Logs)\s*:", re.MULTILINE | re.IGNORECASE
@@ -96,7 +100,7 @@ def extract_source_ips_list(detailed_analysis_text) -> list:
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        label_match = _SOURCE_LABEL.search(line)
+        label_match = _STRONG_SOURCE_LABEL.search(line) or _BARE_IP_LABEL.match(line)
         if label_match:
             # IPs after the label, on the same physical line (anything before
             # the label on that line - e.g. a preceding Affected Backend
@@ -212,5 +216,26 @@ IP:
             f"label variant {label!r} failed: {variant_result}"
         )
     print("\nCase 5 (label spacing/casing variants - SourceIP/SOURCEIP/sourceip/etc.) passed.")
+
+    # Case 6: destination/backend IPs labeled "<word> IP:" must never leak in -
+    # this was the actual bug (bare "IP:" matched anywhere in the line, so
+    # "Destination IP:" was wrongly treated as a source label).
+    dest_leak_text = (
+        "Destination IP: 172.27.7.91\n"
+        "Dest IP: 172.27.7.92\n"
+        "Target IP: 172.27.7.93\n"
+        "Victim IP: 172.27.7.94\n"
+        "Affected Backend IP: 172.27.7.95\n"
+        "Source IP: 203.0.113.9\n"
+        "IP: \n"
+        "203.0.113.10 ISP: Example\n"
+    )
+    result6 = extract_source_ips(detailed_analysis=dest_leak_text)
+    print("\nCase 6 (destination-labeled IPs must not leak into source_ips):")
+    print(json.dumps(result6, indent=2))
+    assert result6["source_ips"] == ["203.0.113.9", "203.0.113.10"], (
+        f"destination IP leaked in: {result6}"
+    )
+    print("\nCase 6 passed - destination IPs correctly excluded.")
 
     print("\nAll cases passed.")
