@@ -129,7 +129,7 @@ def _has_any_label(line: str) -> bool:
     )
 
 
-def _scan_labeled_ips(lines, label_matcher) -> list:
+def _scan_labeled_ips(lines, label_matcher, stop_ips=None) -> list:
     """
     Shared block scanner: wherever label_matcher(line) matches, collect any
     IPs on the rest of that line, then keep consuming following lines that
@@ -139,7 +139,16 @@ def _scan_labeled_ips(lines, label_matcher) -> list:
     leading IP belongs to this block, but the trailing label starts a new
     one, so sweeping must stop right there instead of continuing into the
     next block's own IPs).
+
+    stop_ips: IPs already confirmed to belong to the OTHER side (e.g. the
+    source IP, when scanning for destinations). A long destination/source
+    list is sometimes followed by free-text reputation narrative that keeps
+    repeating that other IP at the start of each sentence (e.g. "1.2.3.4 -
+    Malicious. 1.2.3.4 was first reported..."), which otherwise looks just
+    like more "<ip> ..." continuation lines. Treat hitting one of these as
+    an immediate boundary instead of sweeping into prose about another IP.
     """
+    stop_ips = stop_ips or ()
     found = []
     i = 0
     while i < len(lines):
@@ -148,6 +157,10 @@ def _scan_labeled_ips(lines, label_matcher) -> list:
         if label_match:
             same_line_tail = line[label_match.end():]
             for ip in re.findall(IPV4, same_line_tail):
+                # stop_ips is NOT applied here - an explicit, directly
+                # labeled match ("Destination IP: 1.2.3.4") is trustworthy
+                # even if that same IP also (wrongly) ended up in the other
+                # side's list via its own blind continuation sweep.
                 if ip not in found:
                     found.append(ip)
             j = i + 1
@@ -155,6 +168,8 @@ def _scan_labeled_ips(lines, label_matcher) -> list:
                 candidate = lines[j].strip()
                 ip_match = re.match(rf"^({IPV4})\b", candidate)
                 if not ip_match:
+                    break
+                if ip_match.group(1) in stop_ips:
                     break
                 if ip_match.group(1) not in found:
                     found.append(ip_match.group(1))
@@ -175,7 +190,7 @@ def extract_source_ips_list(detailed_analysis_text) -> list:
     source_ips = _scan_labeled_ips(
         lines, lambda line: _STRONG_SOURCE_LABEL.search(line) or _BARE_IP_LABEL.match(line)
     )
-    destination_ips = _scan_labeled_ips(lines, _DEST_LABEL.search)
+    destination_ips = _scan_labeled_ips(lines, _DEST_LABEL.search, stop_ips=set(source_ips))
 
     # Final safety net: no matter how an IP ended up in source_ips (merged
     # label lines, a continuation sweep grabbing a neighboring line, etc.),
@@ -326,5 +341,36 @@ IP:
     assert result8["source_ip_count"] == 5, f"literal \\n input broke extraction: {result8}"
     assert "172.27.7.91" not in result8["source_ips"]
     print("\nCase 8 passed.")
+
+    # Case 9: FortiGate horizontal port scan format - "SourceIP:" on one
+    # line, the value plus "DestinationIP:" on the next, then ~19 distinct
+    # destination IPs one per line, followed by free-text IP-reputation
+    # narrative about the SOURCE IP that keeps repeating it at the start of
+    # each sentence ("66.240.236.109 - Malicious...", "66.240.236.109 was
+    # first reported..."). That narrative must not get swept into either
+    # list, and the source IP must survive the final exclusion filter.
+    horizontal_scan_text = (
+        "Overview A security alert was generated for suspected Network Service "
+        "Scanning activity originating from external IP addresses \n"
+        "66.240.236.109. The activity targeted multiple destinations on a single "
+        "port. Technical analysis Time: 2026-09-22 13:10:00 Action: Allow SourceIP: \n"
+        "66.240.236.109 DestinationIP:\n"
+        "1.2.46.110 \n"
+        "1.2.46.155 \n"
+        "1.2.46.156 \n"
+        "1.2.46.84 DestinationPort: 443 \n"
+        "66.240.236.109 - Malicious This IP address has been reported a total of "
+        "71,063 times from 1,338 distinct sources. \n"
+        "66.240.236.109 was first reported on December 3rd 2021, and the most "
+        "recent report was 11 minutes ago. ISP CariNet, Inc. Usage Type Data "
+        "Center/Web Hosting/Transit ASN AS10439\n"
+    )
+    result9 = extract_source_ips(detailed_analysis=horizontal_scan_text)
+    print("\nCase 9 (FortiGate horizontal port scan - destination list followed by source-IP reputation narrative):")
+    print(json.dumps(result9, indent=2))
+    assert result9["source_ips"] == ["66.240.236.109"], (
+        f"source IP got cancelled out by the destination sweep overreaching: {result9}"
+    )
+    print("\nCase 9 passed.")
 
     print("\nAll cases passed.")
