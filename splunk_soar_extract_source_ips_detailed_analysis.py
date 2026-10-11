@@ -49,6 +49,17 @@ _STRONG_SOURCE_LABEL = re.compile(
 # of the line - "Destination IP:", "Dest IP:", "Target IP:", "Affected
 # Backend:" etc. must never match this (that was the destination-IP leak).
 _BARE_IP_LABEL = re.compile(r"^\s*IP\s*:", re.IGNORECASE)
+# Anything labeled as the victim/target side - used as a final exclusion
+# filter below, as a safety net on top of _BARE_IP_LABEL being anchored:
+# no matter how an IP ends up in the source list, if it's independently
+# labeled as a destination/backend anywhere in the text, drop it.
+_DEST_LABEL = re.compile(
+    r"(?<![A-Za-z])(?:Destination|Dest|Target|Victim)\s*IPs?\s*:"
+    r"|(?<![A-Za-z])Affected\s+Backend\s*:"
+    r"|(?<![A-Za-z])Backend\s*(?:IPs?)?\s*:"
+    r"|(?<![A-Za-z])dest_ip\s*=",
+    re.IGNORECASE,
+)
 _DETAILED_ANALYSIS_HEADER = re.compile(r"Detailed\s+analysis\s*:", re.IGNORECASE)
 _NEXT_SECTION_BOUNDARY = re.compile(
     r"\*{5,}|^\s*(?:Recommendations|Description|Logs)\s*:", re.MULTILINE | re.IGNORECASE
@@ -91,37 +102,67 @@ def isolate_detailed_analysis(text: str) -> str:
     return text
 
 
-def extract_source_ips_list(detailed_analysis_text) -> list:
-    """Pure function: deduped, order-preserving list of source IPs."""
-    text = isolate_detailed_analysis(refang(as_text(detailed_analysis_text)))
+def _has_any_label(line: str) -> bool:
+    return bool(
+        _STRONG_SOURCE_LABEL.search(line)
+        or _DEST_LABEL.search(line)
+        or _BARE_IP_LABEL.match(line)
+    )
 
-    source_ips = []
-    lines = text.splitlines()
+
+def _scan_labeled_ips(lines, label_matcher) -> list:
+    """
+    Shared block scanner: wherever label_matcher(line) matches, collect any
+    IPs on the rest of that line, then keep consuming following lines that
+    are themselves just "<ip> ..." until one isn't - OR until a continuation
+    line, despite starting with an IP, also carries a *different* label
+    later on the same line (e.g. "172.27.7.91 Source IPs Observed:" - the
+    leading IP belongs to this block, but the trailing label starts a new
+    one, so sweeping must stop right there instead of continuing into the
+    next block's own IPs).
+    """
+    found = []
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        label_match = _STRONG_SOURCE_LABEL.search(line) or _BARE_IP_LABEL.match(line)
+        label_match = label_matcher(line)
         if label_match:
-            # IPs after the label, on the same physical line (anything before
-            # the label on that line - e.g. a preceding Affected Backend
-            # value sharing the line - is correctly left out).
             same_line_tail = line[label_match.end():]
             for ip in re.findall(IPV4, same_line_tail):
-                if ip not in source_ips:
-                    source_ips.append(ip)
+                if ip not in found:
+                    found.append(ip)
             j = i + 1
             while j < len(lines):
-                ip_match = re.match(rf"^({IPV4})\b", lines[j].strip())
+                candidate = lines[j].strip()
+                ip_match = re.match(rf"^({IPV4})\b", candidate)
                 if not ip_match:
                     break
-                if ip_match.group(1) not in source_ips:
-                    source_ips.append(ip_match.group(1))
+                if ip_match.group(1) not in found:
+                    found.append(ip_match.group(1))
                 j += 1
+                if _has_any_label(candidate[ip_match.end():]):
+                    break
             i = j
             continue
         i += 1
+    return found
 
-    return source_ips
+
+def extract_source_ips_list(detailed_analysis_text) -> list:
+    """Pure function: deduped, order-preserving list of source IPs."""
+    text = isolate_detailed_analysis(refang(as_text(detailed_analysis_text)))
+    lines = text.splitlines()
+
+    source_ips = _scan_labeled_ips(
+        lines, lambda line: _STRONG_SOURCE_LABEL.search(line) or _BARE_IP_LABEL.match(line)
+    )
+    destination_ips = _scan_labeled_ips(lines, _DEST_LABEL.search)
+
+    # Final safety net: no matter how an IP ended up in source_ips (merged
+    # label lines, a continuation sweep grabbing a neighboring line, etc.),
+    # if it's independently labeled as a destination/backend anywhere in
+    # this same text, it must never be treated as a source IP.
+    return [ip for ip in source_ips if ip not in destination_ips]
 
 
 def extract_source_ips(detailed_analysis=None, **kwargs):
@@ -237,5 +278,21 @@ IP:
         f"destination IP leaked in: {result6}"
     )
     print("\nCase 6 passed - destination IPs correctly excluded.")
+
+    # Case 7: a destination IP with NO label of its own, sitting right after
+    # a source block, gets swept in as a false "continuation" line - but it
+    # IS independently labeled as a destination elsewhere in the same text,
+    # so the exclusion filter must still drop it.
+    leak_via_sweep_text = (
+        "IP: \n"
+        "203.0.113.20 ISP: Example Host\n"
+        "172.27.7.91\n"
+        "Destination IP: 172.27.7.91\n"
+    )
+    result7 = extract_source_ips(detailed_analysis=leak_via_sweep_text)
+    print("\nCase 7 (unlabeled destination IP right after a source block):")
+    print(json.dumps(result7, indent=2))
+    assert result7["source_ips"] == ["203.0.113.20"], f"destination IP leaked via sweep: {result7}"
+    print("\nCase 7 passed - destination IP excluded via the exclusion filter.")
 
     print("\nAll cases passed.")
