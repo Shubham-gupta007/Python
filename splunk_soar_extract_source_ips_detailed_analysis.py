@@ -83,6 +83,25 @@ def as_text(value) -> str:
     return str(value)
 
 
+def normalize_newlines(text: str) -> str:
+    """
+    Some SOAR datapaths deliver text whose line breaks are the literal two
+    characters backslash+n (e.g. a field that was JSON-encoded upstream and
+    never decoded back to real newline bytes), not actual newline control
+    characters. splitlines() does not split on that literal sequence, so
+    without this the whole text collapses into one giant "line" - every
+    per-line boundary check (block continuation, the destination-IP
+    exclusion scan) then runs across the entire remaining text instead of
+    stopping at the next real line, which can either sweep in IPs it should
+    not (destination IPs) or, once the exclusion filter is involved, wipe
+    out the source list entirely. Convert literal escape sequences to real
+    newlines first; this is a no-op on text that already has real ones.
+    """
+    if not text:
+        return text
+    return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+
+
 def refang(text: str) -> str:
     if not text:
         return text
@@ -150,7 +169,7 @@ def _scan_labeled_ips(lines, label_matcher) -> list:
 
 def extract_source_ips_list(detailed_analysis_text) -> list:
     """Pure function: deduped, order-preserving list of source IPs."""
-    text = isolate_detailed_analysis(refang(as_text(detailed_analysis_text)))
+    text = isolate_detailed_analysis(refang(normalize_newlines(as_text(detailed_analysis_text))))
     lines = text.splitlines()
 
     source_ips = _scan_labeled_ips(
@@ -294,5 +313,18 @@ IP:
     print(json.dumps(result7, indent=2))
     assert result7["source_ips"] == ["203.0.113.20"], f"destination IP leaked via sweep: {result7}"
     print("\nCase 7 passed - destination IP excluded via the exclusion filter.")
+
+    # Case 8: line breaks delivered as the literal two characters "\" + "n"
+    # (not real newline bytes) - e.g. a CEF field that went through JSON
+    # encoding upstream and never got decoded back. Without normalizing
+    # these first, splitlines() treats the whole text as one line and every
+    # boundary check breaks (this reproduced "finds zero source IPs").
+    literal_backslash_n_text = detailed_analysis_only.replace("\n", "\\n")
+    result8 = extract_source_ips(detailed_analysis=literal_backslash_n_text)
+    print("\nCase 8 (literal backslash-n line breaks instead of real newlines):")
+    print(json.dumps(result8, indent=2))
+    assert result8["source_ip_count"] == 5, f"literal \\n input broke extraction: {result8}"
+    assert "172.27.7.91" not in result8["source_ips"]
+    print("\nCase 8 passed.")
 
     print("\nAll cases passed.")
