@@ -186,8 +186,12 @@ def block_apex(ioc_type=None, value=None, note=None, **kwargs):
     }
 
     def _scalar(v):
-        if isinstance(v, list):
-            return v[0] if v else None
+        # SOAR sometimes wraps a value in a list, and can even wrap
+        # each item of a multi-item list in its own one-item list
+        # (e.g. value=[['AAA111'], ['BBB222']]). Unwrap any level of
+        # that nesting down to a plain scalar.
+        while isinstance(v, list):
+            v = v[0] if v else None
         return v
 
     def _to_list(v):
@@ -198,8 +202,8 @@ def block_apex(ioc_type=None, value=None, note=None, **kwargs):
         return [v]
 
     ioc_type = _scalar(ioc_type)
-    values = [v for v in _to_list(value) if v]
-    notes = _to_list(note)
+    values = [v for v in (_scalar(x) for x in _to_list(value)) if v]
+    notes = [_scalar(n) for n in _to_list(note)]
 
     def note_for(index):
         if not notes:

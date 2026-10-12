@@ -174,10 +174,11 @@ def normalize_validate_ioc(ioc_type=None, raw_value=None, **kwargs):
 
     def _scalar(v):
         # SOAR data paths often resolve to a single-item list even for
-        # one value (e.g. raw_value=['185.136.15.66']) - unwrap it so
+        # one value (e.g. raw_value=['185.136.15.66']), and can nest
+        # that more than one level deep - unwrap all of it so
         # downstream code always sees a plain string.
-        if isinstance(v, list):
-            return v[0] if v else None
+        while isinstance(v, list):
+            v = v[0] if v else None
         return v
 
     ioc_type = _scalar(ioc_type)

@@ -85,6 +85,15 @@ def block_fortigate_dc_domain(value=None, comment=None, **kwargs):
         "failed_count": 0,
     }
 
+    def _item_scalar(v):
+        # SOAR sometimes wraps each item of a multi-item list in its
+        # own one-item list (e.g. value=[['a.example'], ['b.example']]).
+        # Unwrap any level of that nesting down to a plain scalar so
+        # it's safe to use as a dict key / set member below.
+        while isinstance(v, list):
+            v = v[0] if v else None
+        return v
+
     def _to_list(v):
         if v is None:
             return []
@@ -92,8 +101,8 @@ def block_fortigate_dc_domain(value=None, comment=None, **kwargs):
             return v
         return [v]
 
-    values = [v for v in _to_list(value) if v]
-    comments = _to_list(comment)
+    values = [v for v in (_item_scalar(x) for x in _to_list(value)) if v]
+    comments = [_item_scalar(c) for c in _to_list(comment)]
 
     def comment_for(index):
         if not comments:

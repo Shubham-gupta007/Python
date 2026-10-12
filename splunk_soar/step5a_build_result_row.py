@@ -57,10 +57,11 @@ def build_result_row(
 
     def _scalar(v):
         # SOAR data paths often resolve to a single-item list even for
-        # one value - unwrap it so the row's fields are always plain
+        # one value, and can nest that more than one level deep -
+        # unwrap all of it so the row's fields are always plain
         # values, not one-element lists.
-        if isinstance(v, list):
-            return v[0] if v else None
+        while isinstance(v, list):
+            v = v[0] if v else None
         return v
 
     row_number = _scalar(row_number)

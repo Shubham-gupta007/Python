@@ -79,8 +79,12 @@ def unblock_fortigate_dc(ioc_type=None, value=None, **kwargs):
     }
 
     def _scalar(v):
-        if isinstance(v, list):
-            return v[0] if v else None
+        # SOAR sometimes wraps a value in a list, and can even wrap
+        # each item of a multi-item list in its own one-item list
+        # (e.g. value=[['1.2.3.4'], ['5.6.7.8']]). Unwrap any level
+        # of that nesting down to a plain scalar.
+        while isinstance(v, list):
+            v = v[0] if v else None
         return v
 
     def _to_list(v):
@@ -91,7 +95,7 @@ def unblock_fortigate_dc(ioc_type=None, value=None, **kwargs):
         return [v]
 
     ioc_type = _scalar(ioc_type)
-    values = [v for v in _to_list(value) if v]
+    values = [v for v in (_scalar(x) for x in _to_list(value)) if v]
 
     TAG = "[DC]"
 
