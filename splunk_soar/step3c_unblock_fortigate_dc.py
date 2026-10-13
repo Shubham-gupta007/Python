@@ -94,8 +94,23 @@ def unblock_fortigate_dc(ioc_type=None, value=None, **kwargs):
             return v
         return [v]
 
+    def _split_multi(v):
+        # A single SOAR data path sometimes resolves to one string
+        # holding several comma/newline-separated indicators instead
+        # of a true list - split those apart too, so each one still
+        # gets unblocked instead of one failed lookup for the whole
+        # joined string.
+        if isinstance(v, str) and ("," in v or "\n" in v):
+            return [p.strip() for p in v.replace("\n", ",").split(",") if p.strip()]
+        return [v]
+
     ioc_type = _scalar(ioc_type)
-    values = [v for v in (_scalar(x) for x in _to_list(value)) if v]
+
+    values = []
+    for raw in _to_list(value):
+        for item in _split_multi(_scalar(raw)):
+            if item:
+                values.append(item)
 
     TAG = "[DC]"
 

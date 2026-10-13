@@ -106,7 +106,23 @@ def block_fortigate_dc_ip(value=None, comment=None, **kwargs):
             return v
         return [v]
 
-    values = [v for v in (_item_scalar(x) for x in _to_list(value)) if v]
+    def _split_multi(v):
+        # A single SOAR data path sometimes resolves to one string
+        # holding several comma/newline-separated indicators (e.g. an
+        # advisory field "193.8.186.33, 45.227.254.210") instead of a
+        # true list - split those apart too, so each one still gets
+        # its own address object instead of one failed lookup for the
+        # whole joined string.
+        if isinstance(v, str) and ("," in v or "\n" in v):
+            return [p.strip() for p in v.replace("\n", ",").split(",") if p.strip()]
+        return [v]
+
+    values = []
+    for raw in _to_list(value):
+        for item in _split_multi(_item_scalar(raw)):
+            if item:
+                values.append(item)
+
     comments = [_item_scalar(c) for c in _to_list(comment)]
 
     def comment_for(index):

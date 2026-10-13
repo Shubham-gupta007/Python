@@ -183,8 +183,25 @@ def unblock_apex(ioc_type=None, value=None, **kwargs):
             return v
         return [v]
 
+    def _split_multi(v, allow_split):
+        # A single SOAR data path sometimes resolves to one string
+        # holding several comma/newline-separated indicators (e.g. an
+        # advisory field "AAA111, BBB222") instead of a true list -
+        # split those apart too. Only done for SHA1/SHA256 (hex
+        # digests never contain a comma); URLs are left alone since a
+        # comma can legitimately appear inside a URL's query string.
+        if allow_split and isinstance(v, str) and ("," in v or "\n" in v):
+            return [p.strip() for p in v.replace("\n", ",").split(",") if p.strip()]
+        return [v]
+
     ioc_type = _scalar(ioc_type)
-    values = [v for v in (_scalar(x) for x in _to_list(value)) if v]
+    allow_split = ioc_type in ("SHA1", "SHA256")
+
+    values = []
+    for raw in _to_list(value):
+        for item in _split_multi(_scalar(raw), allow_split):
+            if item:
+                values.append(item)
 
     if not APEX_CENTRAL_URL or not APEX_APPLICATION_ID or not APEX_API_KEY:
         outputs["detail"] = (
