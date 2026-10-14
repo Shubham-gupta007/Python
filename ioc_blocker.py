@@ -236,31 +236,61 @@ APEX_TYPE_MAP = {
 
 
 # ============================================================
-# CONFIGURATION - FORTIGATE (DC + DR)
+# CONFIGURATION - FORTIGATE DC (BRANCH OFFICE 1)
 # ============================================================
 #
-# Two independent, optional FortiGate sites. An IP/DOMAIN is blocked
-# on every site that's configured (not just one) - see
-# fortigate_targets_configured() and block_via_fortigate() below.
+# Fill these in directly (same style as the Apex Central / Palo Alto
+# settings above) to hardcode this site's connection details instead
+# of relying on environment variables - e.g. change the "" below to
+# FORTIGATE_DC_HOST = "https://10.10.10.10:443". An env var of the
+# same name still overrides whatever is hardcoded here, if set.
+
+FORTIGATE_DC_HOST = os.environ.get("FORTIGATE_DC_HOST", "")
+FORTIGATE_DC_API_KEY = os.environ.get("FORTIGATE_DC_API_KEY", "")
+FORTIGATE_DC_VDOM = os.environ.get("FORTIGATE_DC_VDOM", "root")
+FORTIGATE_DC_IP_GROUP = os.environ.get("FORTIGATE_DC_IP_GROUP", "Blocked-IPs")
+FORTIGATE_DC_DOMAIN_GROUP = os.environ.get("FORTIGATE_DC_DOMAIN_GROUP", "Blocked-Domains")
+FORTIGATE_DC_VERIFY_TLS = os.environ.get("FORTIGATE_DC_VERIFY_TLS", "false").lower() == "true"
+
+
+# ============================================================
+# CONFIGURATION - FORTIGATE DR (BRANCH OFFICE 2)
+# ============================================================
+#
+# Same idea as DC above - independent of it, and optional. Leaving a
+# site's host/api_key blank just means that site is skipped.
+
+FORTIGATE_DR_HOST = os.environ.get("FORTIGATE_DR_HOST", "")
+FORTIGATE_DR_API_KEY = os.environ.get("FORTIGATE_DR_API_KEY", "")
+FORTIGATE_DR_VDOM = os.environ.get("FORTIGATE_DR_VDOM", "root")
+FORTIGATE_DR_IP_GROUP = os.environ.get("FORTIGATE_DR_IP_GROUP", "Blocked-IPs")
+FORTIGATE_DR_DOMAIN_GROUP = os.environ.get("FORTIGATE_DR_DOMAIN_GROUP", "Blocked-Domains")
+FORTIGATE_DR_VERIFY_TLS = os.environ.get("FORTIGATE_DR_VERIFY_TLS", "false").lower() == "true"
 
 FORTIGATE_ADDRESS_PATH = "/api/v2/cmdb/firewall/address"
 FORTIGATE_GROUP_PATH = "/api/v2/cmdb/firewall/addrgrp"
 
-
-def _load_fortigate_site(prefix):
-    return {
-        "host": os.environ.get(f"FORTIGATE_{prefix}_HOST", ""),
-        "api_key": os.environ.get(f"FORTIGATE_{prefix}_API_KEY", ""),
-        "vdom": os.environ.get(f"FORTIGATE_{prefix}_VDOM", "root"),
-        "ip_group": os.environ.get(f"FORTIGATE_{prefix}_IP_GROUP", "Blocked-IPs"),
-        "domain_group": os.environ.get(f"FORTIGATE_{prefix}_DOMAIN_GROUP", "Blocked-Domains"),
-        "verify_tls": os.environ.get(f"FORTIGATE_{prefix}_VERIFY_TLS", "false").lower() == "true",
-    }
-
-
+# Two independent, optional FortiGate sites, built from the DC/DR
+# settings above. An IP/DOMAIN is blocked on every site that's
+# configured (not just one) - see fortigate_site_configured() and
+# block_via_fortigate() below.
 FORTIGATE_SITES = {
-    "DC": _load_fortigate_site("DC"),
-    "DR": _load_fortigate_site("DR"),
+    "DC": {
+        "host": FORTIGATE_DC_HOST,
+        "api_key": FORTIGATE_DC_API_KEY,
+        "vdom": FORTIGATE_DC_VDOM,
+        "ip_group": FORTIGATE_DC_IP_GROUP,
+        "domain_group": FORTIGATE_DC_DOMAIN_GROUP,
+        "verify_tls": FORTIGATE_DC_VERIFY_TLS,
+    },
+    "DR": {
+        "host": FORTIGATE_DR_HOST,
+        "api_key": FORTIGATE_DR_API_KEY,
+        "vdom": FORTIGATE_DR_VDOM,
+        "ip_group": FORTIGATE_DR_IP_GROUP,
+        "domain_group": FORTIGATE_DR_DOMAIN_GROUP,
+        "verify_tls": FORTIGATE_DR_VERIFY_TLS,
+    },
 }
 
 
