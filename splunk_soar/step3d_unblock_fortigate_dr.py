@@ -49,6 +49,7 @@ def unblock_fortigate_dr(ioc_type=None, value=None, **kwargs):
         failed_count (CEF type: numeric)
     """
     ########################## Custom Code Goes Below This Line ##########################
+    import ast
     import json
     import os
     import ssl
@@ -93,12 +94,31 @@ def unblock_fortigate_dr(ioc_type=None, value=None, **kwargs):
 
     def _split_multi(v):
         # A single SOAR data path sometimes resolves to one string
-        # holding several comma/newline-separated indicators instead
-        # of a true list - split those apart too, so each one still
-        # gets unblocked instead of one failed lookup for the whole
-        # joined string.
-        if isinstance(v, str) and ("," in v or "\n" in v):
-            return [p.strip() for p in v.replace("\n", ",").split(",") if p.strip()]
+        # instead of a true list. Two shapes show up in practice:
+        #   1. a stringified Python list, e.g.
+        #      "['1.2.3.4', '5.6.7.8']" (a static/"Format" field
+        #      stringified an actual list) - ast.literal_eval parses
+        #      that back into real items.
+        #   2. a plain comma/newline-joined string.
+        # Either way, split it apart so each one still gets unblocked
+        # instead of one failed lookup for the whole joined/bracketed
+        # string.
+        if not isinstance(v, str):
+            return [v]
+
+        stripped = v.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = ast.literal_eval(stripped)
+                if isinstance(parsed, (list, tuple)):
+                    return [str(p).strip() for p in parsed if str(p).strip()]
+            except (ValueError, SyntaxError):
+                pass
+
+        if "," in v or "\n" in v:
+            parts = [p.strip().strip("[]'\" ") for p in v.replace("\n", ",").split(",")]
+            return [p for p in parts if p]
+
         return [v]
 
     ioc_type = _scalar(ioc_type)

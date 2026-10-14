@@ -57,6 +57,7 @@ def block_fortigate_dc_ip(value=None, comment=None, **kwargs):
         failed_count (CEF type: numeric)
     """
     ########################## Custom Code Goes Below This Line ##########################
+    import ast
     import ipaddress
     import json
     import os
@@ -108,13 +109,32 @@ def block_fortigate_dc_ip(value=None, comment=None, **kwargs):
 
     def _split_multi(v):
         # A single SOAR data path sometimes resolves to one string
-        # holding several comma/newline-separated indicators (e.g. an
-        # advisory field "193.8.186.33, 45.227.254.210") instead of a
-        # true list - split those apart too, so each one still gets
-        # its own address object instead of one failed lookup for the
-        # whole joined string.
-        if isinstance(v, str) and ("," in v or "\n" in v):
-            return [p.strip() for p in v.replace("\n", ",").split(",") if p.strip()]
+        # instead of a true list. Two shapes show up in practice:
+        #   1. a stringified Python list, e.g.
+        #      "['77.91.118.10', '80.75.212.113', '87.251.64.13']"
+        #      (a static/"Format" field stringified an actual list) -
+        #      ast.literal_eval parses that back into real items.
+        #   2. a plain comma/newline-joined string, e.g.
+        #      "193.8.186.33, 45.227.254.210".
+        # Either way, split it apart so each indicator still gets its
+        # own address object instead of one failed lookup for the
+        # whole joined/bracketed string.
+        if not isinstance(v, str):
+            return [v]
+
+        stripped = v.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = ast.literal_eval(stripped)
+                if isinstance(parsed, (list, tuple)):
+                    return [str(p).strip() for p in parsed if str(p).strip()]
+            except (ValueError, SyntaxError):
+                pass
+
+        if "," in v or "\n" in v:
+            parts = [p.strip().strip("[]'\" ") for p in v.replace("\n", ",").split(",")]
+            return [p for p in parts if p]
+
         return [v]
 
     values = []

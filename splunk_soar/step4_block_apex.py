@@ -57,6 +57,7 @@ def block_apex(ioc_type=None, value=None, note=None, **kwargs):
         failed_count (CEF type: numeric)
     """
     ########################## Custom Code Goes Below This Line ##########################
+    import ast
     import base64
     import hashlib
     import hmac
@@ -201,15 +202,37 @@ def block_apex(ioc_type=None, value=None, note=None, **kwargs):
             return v
         return [v]
 
-    def _split_multi(v, allow_split):
+    def _split_multi(v, allow_comma_split):
         # A single SOAR data path sometimes resolves to one string
-        # holding several comma/newline-separated indicators (e.g. an
-        # advisory field "AAA111, BBB222") instead of a true list -
-        # split those apart too. Only done for SHA1/SHA256 (hex
-        # digests never contain a comma); URLs are left alone since a
-        # comma can legitimately appear inside a URL's query string.
-        if allow_split and isinstance(v, str) and ("," in v or "\n" in v):
-            return [p.strip() for p in v.replace("\n", ",").split(",") if p.strip()]
+        # instead of a true list. Two shapes show up in practice:
+        #   1. a stringified Python list, e.g.
+        #      "['AAA111', 'BBB222']" or
+        #      "['https://a.example', 'https://b.example']" (a
+        #      static/"Format" field stringified an actual list) -
+        #      ast.literal_eval parses that back into real items. A
+        #      value never legitimately starts with "[" (a URL starts
+        #      with its scheme), so this is safe for every ioc_type.
+        #   2. a plain comma/newline-joined string, e.g.
+        #      "AAA111, BBB222" - only split for SHA1/SHA256 (hex
+        #      digests never contain a comma); URLs are left alone
+        #      here since a bare comma can legitimately appear inside
+        #      a URL's query string.
+        if not isinstance(v, str):
+            return [v]
+
+        stripped = v.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = ast.literal_eval(stripped)
+                if isinstance(parsed, (list, tuple)):
+                    return [str(p).strip() for p in parsed if str(p).strip()]
+            except (ValueError, SyntaxError):
+                pass
+
+        if allow_comma_split and ("," in v or "\n" in v):
+            parts = [p.strip().strip("[]'\" ") for p in v.replace("\n", ",").split(",")]
+            return [p for p in parts if p]
+
         return [v]
 
     ioc_type = _scalar(ioc_type)
