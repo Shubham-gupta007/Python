@@ -69,10 +69,13 @@ Firewall platforms:
     would be far too slow for a bulk run).
 
 Requirements:
-    pip install requests openpyxl
+    pip install requests
 
-    openpyxl writes the multi-sheet .xlsx results workbook (see
-    "Output" below) - there's no CSV fallback, so it's required.
+    openpyxl is optional: if installed, it's used to write the
+    multi-sheet .xlsx results workbook (see "Output" below). If it's
+    not installed (e.g. on an air-gapped machine with no pip access),
+    a small built-in stdlib-only .xlsx writer is used instead -
+    same output format, zero extra installs either way.
 
     Geo-IP checking needs no extra packages for either
     GEOIP_METHOD="offline" (default) or GEOIP_METHOD="virustotal" -
@@ -1604,6 +1607,295 @@ def print_summary(results):
         )
 
 
+# ============================================================
+# STDLIB .XLSX FALLBACK (used when openpyxl isn't installed)
+# ============================================================
+#
+# A minimal, hand-rolled .xlsx writer: just zipfile + string-built
+# OOXML XML, both standard library. Not a general-purpose xlsx
+# library - it implements exactly the small slice of openpyxl's API
+# that _write_detail_sheet()/_write_summary_sheet()/_autofit_columns()
+# below use (Workbook, worksheet.append(), worksheet[1]/["A1"],
+# worksheet.columns, column_dimensions[...].width, freeze_panes,
+# Font(bold=...), PatternFill(...)) so those three functions work
+# unchanged no matter which backend is active.
+
+def _stdlib_xlsx_column_letter(index):
+    """1-indexed column number -> spreadsheet column letters (1->A, 27->AA)."""
+    letters = ""
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def _stdlib_xlsx_column_index(letters):
+    """Spreadsheet column letters -> 1-indexed column number (inverse of the above)."""
+    index = 0
+    for char in letters:
+        index = index * 26 + (ord(char.upper()) - 64)
+    return index
+
+
+class _StdlibXlsxFont:
+    def __init__(self, bold=False, size=11):
+        self.bold = bold
+        self.size = size
+
+
+class _StdlibXlsxPatternFill:
+    def __init__(self, start_color=None, end_color=None, fill_type=None):
+        self.start_color = start_color
+        self.fill_type = fill_type
+
+
+class _StdlibXlsxCell:
+    __slots__ = ("value", "font", "fill", "column_letter")
+
+    def __init__(self, value=None, column_letter=""):
+        self.value = value
+        self.font = None
+        self.fill = None
+        self.column_letter = column_letter
+
+
+class _StdlibXlsxColumnDimension:
+    def __init__(self):
+        self.width = None
+
+
+class _StdlibXlsxColumnDimensions(dict):
+    def __getitem__(self, key):
+        if key not in self:
+            dict.__setitem__(self, key, _StdlibXlsxColumnDimension())
+        return dict.__getitem__(self, key)
+
+
+class _StdlibXlsxWorksheet:
+    def __init__(self, title):
+        self.title = title
+        self.rows = []
+        self.freeze_panes = None
+        self.column_dimensions = _StdlibXlsxColumnDimensions()
+
+    def append(self, values):
+        self.rows.append([_StdlibXlsxCell(value, _stdlib_xlsx_column_letter(i + 1)) for i, value in enumerate(values)])
+
+    @property
+    def max_row(self):
+        return len(self.rows)
+
+    @property
+    def columns(self):
+        width = max((len(row) for row in self.rows), default=0)
+        columns = []
+        for col_index in range(width):
+            column_cells = []
+            for row in self.rows:
+                if col_index < len(row):
+                    column_cells.append(row[col_index])
+                else:
+                    column_cells.append(_StdlibXlsxCell(None, _stdlib_xlsx_column_letter(col_index + 1)))
+            columns.append(column_cells)
+        return columns
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self.rows[key - 1]
+
+        letters = "".join(ch for ch in key if ch.isalpha())
+        row_number = int("".join(ch for ch in key if ch.isdigit()))
+        col_index = _stdlib_xlsx_column_index(letters) - 1
+
+        row = self.rows[row_number - 1]
+        while len(row) <= col_index:
+            row.append(_StdlibXlsxCell(None, _stdlib_xlsx_column_letter(len(row) + 1)))
+        return row[col_index]
+
+
+class _StdlibXlsxWorkbook:
+    def __init__(self):
+        self._sheets = [_StdlibXlsxWorksheet("Sheet")]
+
+    @property
+    def active(self):
+        return self._sheets[0]
+
+    def create_sheet(self, title):
+        sheet = _StdlibXlsxWorksheet(title)
+        self._sheets.append(sheet)
+        return sheet
+
+    def save(self, output_file):
+        _stdlib_xlsx_save(self._sheets, output_file)
+
+
+def _stdlib_xlsx_cell_style_key(cell):
+    bold = bool(cell.font and cell.font.bold)
+    size = cell.font.size if (cell.font and cell.font.bold) else 11
+    filled = bool(cell.fill and cell.fill.fill_type)
+    return (bold, size, filled)
+
+
+def _stdlib_xlsx_sheet_xml(worksheet, style_index):
+    column_widths = []
+    for letters, dimension in worksheet.column_dimensions.items():
+        if dimension.width:
+            column_widths.append((_stdlib_xlsx_column_index(letters), dimension.width))
+    column_widths.sort()
+
+    cols_xml = ""
+    if column_widths:
+        cols_xml = "<cols>" + "".join(
+            f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>' for index, width in column_widths
+        ) + "</cols>"
+
+    view_xml = "<sheetViews><sheetView workbookViewId=\"0\">"
+    if worksheet.freeze_panes:
+        view_xml += '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+        view_xml += '<selection pane="bottomLeft" activeCell="A2" sqref="A2"/>'
+    view_xml += "</sheetView></sheetViews>"
+
+    rows_xml = []
+    for row_number, row in enumerate(worksheet.rows, start=1):
+        cells_xml = []
+        for cell in row:
+            if cell.value is None or cell.value == "":
+                continue
+            style_attr = f' s="{style_index[_stdlib_xlsx_cell_style_key(cell)]}"'
+            ref = f"{cell.column_letter}{row_number}"
+            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                cells_xml.append(f'<c r="{ref}"{style_attr}><v>{cell.value}</v></c>')
+            else:
+                text = xml_escape(str(cell.value))
+                cells_xml.append(f'<c r="{ref}" t="inlineStr"{style_attr}><is><t xml:space="preserve">{text}</t></is></c>')
+        rows_xml.append(f'<row r="{row_number}">' + "".join(cells_xml) + "</row>")
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        + cols_xml + view_xml + "<sheetData>" + "".join(rows_xml) + "</sheetData>"
+        "</worksheet>"
+    )
+
+
+def _stdlib_xlsx_styles_xml(style_index):
+    # style_index maps (bold, size, filled) -> cellXfs index. Index 0
+    # is always the default (no bold, size 11, no fill).
+    fonts_xml = []
+    fills_xml = ['<fill><patternFill patternType="none"/></fill>', '<fill><patternFill patternType="gray125"/></fill>']
+    xfs_xml = []
+
+    fill_id_for_filled = 2  # first two fill slots (0,1) are reserved by the xlsx spec
+    fills_xml.append('<fill><patternFill patternType="solid"><fgColor rgb="FFDDEBF7"/><bgColor indexed="64"/></patternFill></fill>')
+
+    for key, index in sorted(style_index.items(), key=lambda item: item[1]):
+        bold, size, filled = key
+        fonts_xml.append(f'<font><sz val="{size}"/><name val="Calibri"/>{"<b/>" if bold else ""}</font>')
+        fill_id = fill_id_for_filled if filled else 0
+        xfs_xml.append(
+            f'<xf numFmtId="0" fontId="{index}" fillId="{fill_id}" borderId="0" xfId="0" '
+            f'applyFont="1" applyFill="{"1" if filled else "0"}"/>'
+        )
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<fonts count="{len(fonts_xml)}">' + "".join(fonts_xml) + "</fonts>"
+        f'<fills count="{len(fills_xml)}">' + "".join(fills_xml) + "</fills>"
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        f'<cellXfs count="{len(xfs_xml)}">' + "".join(xfs_xml) + "</cellXfs>"
+        "</styleSheet>"
+    )
+
+
+def _stdlib_xlsx_save(sheets, output_file):
+    import zipfile
+
+    # Collect every distinct (bold, size, filled) style combo used
+    # across all sheets, in first-seen order, and give each one a
+    # cellXfs index - referenced by each cell's s="..." attribute.
+    style_index = {(False, 11, False): 0}
+    for sheet in sheets:
+        for row in sheet.rows:
+            for cell in row:
+                key = _stdlib_xlsx_cell_style_key(cell)
+                if key not in style_index:
+                    style_index[key] = len(style_index)
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        + "".join(
+            f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for i in range(1, len(sheets) + 1)
+        )
+        + "</Types>"
+    )
+
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        "<sheets>"
+        + "".join(
+            f'<sheet name="{xml_escape(sheet.title)}" sheetId="{i}" r:id="rId{i}"/>'
+            for i, sheet in enumerate(sheets, start=1)
+        )
+        + "</sheets></workbook>"
+    )
+
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(
+            f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>'
+            for i in range(1, len(sheets) + 1)
+        )
+        + f'<Relationship Id="rId{len(sheets) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        "</Relationships>"
+    )
+
+    with zipfile.ZipFile(output_file, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("xl/workbook.xml", workbook_xml)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        archive.writestr("xl/styles.xml", _stdlib_xlsx_styles_xml(style_index))
+        for i, sheet in enumerate(sheets, start=1):
+            archive.writestr(f"xl/worksheets/sheet{i}.xml", _stdlib_xlsx_sheet_xml(sheet, style_index))
+
+
+def _xlsx_backend():
+    """
+    Returns (Workbook, Font, PatternFill) - from openpyxl if it's
+    installed, otherwise from the pure-stdlib fallback above (zero
+    pip installs needed, which matters on an air-gapped machine).
+    Same three names either way, so _write_detail_sheet(),
+    _write_summary_sheet() and write_results_workbook() below never
+    need to know which backend is actually in use.
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+
+        return Workbook, Font, PatternFill
+    except ImportError:
+        return _StdlibXlsxWorkbook, _StdlibXlsxFont, _StdlibXlsxPatternFill
+
+
 def _autofit_columns(worksheet):
     for column_cells in worksheet.columns:
         length = max((len(str(cell.value)) for cell in column_cells if cell.value is not None), default=8)
@@ -1611,7 +1903,7 @@ def _autofit_columns(worksheet):
 
 
 def _write_detail_sheet(worksheet, rows):
-    from openpyxl.styles import Font, PatternFill
+    _, Font, PatternFill = _xlsx_backend()
 
     header_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
 
@@ -1628,7 +1920,7 @@ def _write_detail_sheet(worksheet, rows):
 
 
 def _write_summary_sheet(worksheet, results):
-    from openpyxl.styles import Font, PatternFill
+    _, Font, PatternFill = _xlsx_backend()
 
     header_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
     bold = Font(bold=True)
@@ -1672,8 +1964,11 @@ def write_results_workbook(output_file, results):
         Blocked      - every row that was successfully blocked
         Not Blocked  - everything else (Failed/Invalid/Skipped/Would Block)
         All Results  - every row, unfiltered (the full detail)
+
+    Uses openpyxl if it's installed, otherwise the stdlib-only
+    fallback writer above - see _xlsx_backend().
     """
-    from openpyxl import Workbook
+    Workbook, _, _ = _xlsx_backend()
 
     workbook = Workbook()
 
