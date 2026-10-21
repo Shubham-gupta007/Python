@@ -9,10 +9,13 @@ worked and two that broke BMC Remedy ticket creation.
 """
 
 import base64
+import inspect
 import json
 import random
+import sys
 import time
 import unittest
+from unittest import mock
 
 from splunk_soar_build_remedy_fields_json import build_remedy_fields_json
 from splunk_soar_sanitize_description_cf import custom_function_body, sanitize_description
@@ -310,15 +313,52 @@ class Fuzz(unittest.TestCase):
 
 
 class PasteBlock(unittest.TestCase):
-    def test_paste_block_runs_on_its_own(self):
-        body = custom_function_body()
-        self.assertTrue(body.startswith("    import json\n    import re\n"))
-        self.assertTrue(body.rstrip().endswith("return outputs"))
-        namespace = {}
-        exec("def pasted(**kwargs):\n" + body, namespace)  # no module-level imports available
+    """The block pasted under the editor's marker, run under def lines the way SOAR generates them."""
+
+    BODY = custom_function_body()
+    MARKER = "    ############################ Custom Code Goes Below This Line #################################\n"
+
+    def pasted(self, def_line, prefix=""):
+        namespace = {}  # no module-level imports: the block has to bring its own
+        exec(def_line + "\n" + self.MARKER + prefix + self.BODY, namespace)
+        return namespace[def_line.split()[1].split("(")[0]]
+
+    def test_block_shape(self):
+        self.assertTrue(self.BODY.isascii())
+        self.assertNotIn("\t", self.BODY)
+        self.assertIn("    import phantom.rules as phantom\n", self.BODY)
+        self.assertTrue(self.BODY.rstrip().endswith("return outputs"))
+        self.assertIn(self.MARKER, inspect.getsource(sanitize_description))
+
+    def test_under_the_generated_header(self):
+        fn = self.pasted("def sanitize_description(description=None, max_length=None, **kwargs):")
         for name, sample in SHAPED.items():
             with self.subTest(name):
-                self.assertEqual(namespace["pasted"](description=sample), sanitize(sample))
+                self.assertEqual(fn(description=sample), sanitize(sample))
+        self.assertEqual(fn(description="x" * 50, max_length="10")["description_plain"], "xxxxxxx...")
+
+    def test_max_length_not_declared(self):
+        fn = self.pasted("def sanitize_description(description=None, **kwargs):")
+        self.assertEqual(fn(description=INVALID_ESCAPE_SHAPED), sanitize(INVALID_ESCAPE_SHAPED))
+        self.assertEqual(fn(description="x" * 50, max_length="10")["description_plain"], "xxxxxxx...")
+
+    def test_text_input_with_another_name(self):
+        fn = self.pasted("def sanitize_description(detailed_description=None, **kwargs):")
+        self.assertEqual(fn(detailed_description=WORKING_SHAPED), sanitize(WORKING_SHAPED))
+
+    def test_default_imports_left_above_the_block(self):
+        fn = self.pasted(
+            "def sanitize_description(description=None, **kwargs):",
+            prefix="    import json\n    import phantom.rules as phantom\n\n",
+        )
+        self.assertEqual(fn(description=SCREENSHOT_SHAPED), sanitize(SCREENSHOT_SHAPED))
+        self.assertEqual(fn(description=None), {"description": "", "description_plain": ""})
+
+    def test_logs_one_debug_line(self):
+        with mock.patch.object(sys.modules["phantom.rules"], "debug") as debug:
+            sanitize(SCREENSHOT_SHAPED)
+        debug.assert_called_once()
+        self.assertIn("decoded 1 escape level(s), removed 1 embedded image(s)", debug.call_args[0][0])
 
 
 if __name__ == "__main__":

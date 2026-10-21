@@ -1,7 +1,6 @@
 r"""
-Splunk SOAR "Custom Functions" library entry (Administration > Custom
-Functions > New Custom Function - the /custom_function/ editor, Python 3.13
-stub with a bare **kwargs signature and a plain `return outputs` dict).
+Splunk SOAR Custom Function: sanitize_description
+(Administration > Custom Functions > New Custom Function).
 
 Makes any Description / Detailed_Decription text safe to drop into the BMC
 Remedy ITSM create-ticket JSON, whatever shape it arrives in. Each of these
@@ -37,14 +36,25 @@ What it does, in order:
   6. Escapes the result exactly once.
 
 Editor setup (left panel):
-  Name              : sanitize_description (or any name you like)
-  Add Input         : Name = description        | Data Type = string
-  Add Input         : Name = max_length         | Data Type = string
-                       (optional - leave it unwired for no limit, or e.g.
-                       100 when feeding Remedy's short Description field)
-  Add Output (Item) : Name = description        | Data Type = string
-  Add Output (Item) : Name = description_plain  | Data Type = string
-                       (output Names must match the keys set on `outputs`)
+  Name    : sanitize_description
+  Input   : description        | CEF Data Type = string
+  Input   : max_length         | CEF Data Type = string   (optional - e.g. 100
+            for Remedy's short Description field; leave it out for no limit)
+  Output  : description        | CEF Data Type = string   (Item)
+  Output  : description_plain  | CEF Data Type = string   (Item)
+
+SOAR then generates the locked header you see in sanitize_description()
+below: the def line with one argument per input, the docstring, and the
+"Custom Code Goes Below This Line" marker. Delete everything under that
+marker - the default "import json ... return outputs" lines - and paste
+exactly what
+
+    python3 splunk_soar_sanitize_description_cf.py --body
+
+prints. It is read straight from sanitize_description() below, so it cannot
+drift from the tested code (test_splunk_soar_sanitize_description_cf.py).
+The block reads its inputs from the def line and from **kwargs alike, so it
+works whether or not max_length was declared.
 
 Which output goes where:
   description        escaped, no surrounding quotes - put it INSIDE the
@@ -54,33 +64,44 @@ Which output goes where:
                      their own (splunk_soar_build_remedy_fields_json.py, or
                      a JSON-typed action parameter). Never put this one
                      inside a hand-built JSON template.
-
-Only the code between the "Custom Code Goes Below This Line" markers is
-editable in SOAR's editor. Paste exactly what
-
-    python3 splunk_soar_sanitize_description_cf.py --body
-
-prints there. It is read straight from sanitize_description() below, so it
-cannot drift from the tested code (test_splunk_soar_sanitize_description_cf.py).
 """
 
 import inspect
 import json
 import sys
+import types
+
+try:
+    import phantom.rules  # noqa: F401 - only exists inside SOAR
+except ImportError:
+    # Local runs and tests: a stand-in so the pasted block's `import phantom.rules` works.
+    _rules = types.ModuleType("phantom.rules")
+    _rules.debug = lambda *args, **kwargs: None
+    sys.modules["phantom"] = types.ModuleType("phantom")
+    sys.modules["phantom"].rules = _rules
+    sys.modules["phantom.rules"] = _rules
 
 
-def sanitize_description(**kwargs):
+def sanitize_description(description=None, max_length=None, **kwargs):
     """
+    Args:
+        description (CEF type: string)
+        max_length (CEF type: string)
+
     Returns a JSON-serializable object that implements the configured data paths:
-        description, description_plain
+        description (CEF type: string)
+        description_plain (CEF type: string)
     """
-
-    ################################################################################
-    ## Custom Code Goes Below This Line
-    ################################################################################
+    ############################ Custom Code Goes Below This Line #################################
+    # SOAR passes each input declared in the editor as a named argument on the def
+    # line; anything else lands in **kwargs. Read both, so the block works whether or
+    # not max_length was declared, or if the text input got a different name.
+    inputs = {k: v for k, v in dict(locals()).items() if k != "kwargs" and type(v).__name__ != "module"}
+    inputs.update(kwargs)
 
     import json
     import re
+    import phantom.rules as phantom
 
     outputs = {}
 
@@ -115,15 +136,17 @@ def sanitize_description(**kwargs):
             text,
         )
 
-    source = kwargs.get("description")
+    source = inputs.get("description")
     if source is None:
         # Input named something else in the editor (e.g. Detailed_Decription): use that one.
-        source = next((v for k, v in kwargs.items() if k != "max_length" and v is not None), None)
+        source = next((v for k, v in inputs.items() if k != "max_length" and v is not None), None)
     text = to_text(source)
+    length_in = len(text)
 
     # Decode text that arrives already JSON-escaped - possibly wrapped in quotes or
     # escaped twice - so it ends up escaped exactly once below.
-    for _ in range(3):
+    decoded = 0
+    while decoded < 3:
         stripped = text.strip()
         if len(stripped) >= 2 and stripped[0] == stripped[-1] == '"' and looks_escaped(stripped[1:-1]):
             text = unescape(stripped[1:-1])
@@ -131,6 +154,7 @@ def sanitize_description(**kwargs):
             text = unescape(text)
         else:
             break
+        decoded += 1
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     # \ud83c\uddfa-style escapes leave surrogate halves: join the pairs, drop strays below.
@@ -155,7 +179,7 @@ def sanitize_description(**kwargs):
         gap = match.group(1) + match.group(2)
         return "\n" if "\n" in gap else (" " if gap else "")
 
-    text = embedded.sub(drop, text)
+    text, removed = embedded.subn(drop, text)
 
     # Flag emoji are pairs of regional-indicator letters: keep them as the country code.
     text = re.sub("[\U0001F1E6-\U0001F1FF]", lambda m: chr(ord(m.group(0)) - 0x1F1E6 + ord("A")), text)
@@ -176,29 +200,30 @@ def sanitize_description(**kwargs):
     ).strip()
 
     try:
-        max_length = int(to_text(kwargs.get("max_length")).strip() or 0)
+        limit = int(to_text(inputs.get("max_length")).strip() or 0)
     except ValueError:
-        max_length = 0
-    if 0 < max_length < len(text):
-        text = text[: max_length - 3].rstrip() + "..." if max_length > 3 else text[:max_length]
+        limit = 0
+    if 0 < limit < len(text):
+        text = text[: limit - 3].rstrip() + "..." if limit > 3 else text[:limit]
 
     outputs["description"] = json.dumps(text)[1:-1]  # escaped once; outer quotes dropped for your "..." slot
     outputs["description_plain"] = text
 
+    phantom.debug(
+        f"sanitize_description: {length_in} -> {len(text)} chars, "
+        f"decoded {decoded} escape level(s), removed {removed} embedded image(s)"
+    )
+
     # Return a JSON-serializable object
     assert json.dumps(outputs)  # Will raise an exception if the :outputs: object is not JSON-serializable
     return outputs
-    ################################################################################
-    ## Custom Code Goes Above This Line
-    ################################################################################
 
 
 def custom_function_body():
-    """The exact block to paste between SOAR's "Custom Code" markers, read from the function above."""
+    """The block to paste under SOAR's "Custom Code Goes Below This Line" marker, read from the function above."""
     lines = inspect.getsource(sanitize_description).splitlines()
-    start = next(i for i, line in enumerate(lines) if "Custom Code Goes Below This Line" in line) + 2
-    end = next(i for i, line in enumerate(lines) if "Custom Code Goes Above This Line" in line) - 1
-    return "\n".join(lines[start:end]).strip("\n") + "\n"
+    start = next(i for i, line in enumerate(lines) if "Custom Code Goes Below This Line" in line) + 1
+    return "\n".join(lines[start:]).strip("\n") + "\n"
 
 
 CUSTOM_FUNCTION_BODY = custom_function_body()
