@@ -32,8 +32,8 @@ Single entry point for the threat-intel workflow:
 
     4. Route the now-valid, non-allowlisted, non-UAE indicator to
        every configured platform that can block its type - an IOC can
-       go to more than one platform, and each attempt gets its own row
-       in the results CSV:
+       go to more than one platform, and every platform gets its own
+       Status/Detail column pair on that IOC's one row:
 
            IP        -> FortiGate DC, FortiGate DR, AND Palo Alto
                          (each independently configured/optional -
@@ -47,10 +47,12 @@ Single entry point for the threat-intel workflow:
                         (User-Defined Suspicious Object)
 
     5. Write one results CSV you can open in Excel: original value,
-       auto-corrected value, which platform it went to, the IP's
-       country (when looked up), and whether it was blocked
-       successfully - so a quick filter tells you exactly what
-       succeeded, what was skipped, and what needs a human look.
+       auto-corrected value, the IP's country (when looked up), an
+       overall Blocked/Partially Blocked/Failed/Invalid/Skipped
+       status, and - for every IOC - a Status + Detail column for
+       each of FortiGate DC, FortiGate DR, Palo Alto and Apex, so one
+       row tells you exactly which platform(s) blocked it, which
+       didn't, and why.
 
 Firewall platforms:
 
@@ -71,11 +73,9 @@ Firewall platforms:
 Requirements:
     pip install requests
 
-    openpyxl is optional: if installed, it's used to write the
-    multi-sheet .xlsx results workbook (see "Output" below). If it's
-    not installed (e.g. on an air-gapped machine with no pip access),
-    a small built-in stdlib-only .xlsx writer is used instead -
-    same output format, zero extra installs either way.
+    Results are written as plain CSV (the "csv" standard library
+    module) - no extra package needed for that, which matters on an
+    air-gapped machine with no pip access.
 
     Geo-IP checking needs no extra packages for either
     GEOIP_METHOD="offline" (default) or GEOIP_METHOD="virustotal" -
@@ -109,9 +109,13 @@ Environment variables:
         FORTIGATE_DR_DOMAIN_GROUP
         FORTIGATE_DR_VERIFY_TLS
 
-    Palo Alto (optional; IP blocking only):
+    Palo Alto (optional; IP blocking only). Authenticates with a
+    username/password (not a pre-generated API key) - a session API
+    key is obtained once per run via PAN-OS's type=keygen endpoint
+    and reused for every block/commit call that run:
         PALOALTO_HOST            e.g. "https://192.168.1.1"
-        PALOALTO_API_KEY         a pre-generated PAN-OS API key
+        PALOALTO_USERNAME        a PAN-OS admin/API user
+        PALOALTO_PASSWORD        that user's password
         PALOALTO_VSYS            optional, default "vsys1"
         PALOALTO_IP_GROUP        optional, default "Blocked-IPs"
         PALOALTO_VERIFY_TLS      optional, "true"/"false", default "false"
@@ -181,19 +185,35 @@ Input CSV format (column names are case-insensitive):
     SHA1,0123456789abcdef0123456789abcdef01234567,Dropper hash
     SHA256,c71ddfa376b2a86bae93d46d997742502d127979a8774402c936ec6832bb91d0,Ransomware hash
 
-Output: <input file name>_results_<YYYYMMDD_HHMMSS>.xlsx - a new,
-timestamped file every run, so nothing gets overwritten. It's an Excel
-workbook with four sheets, each using the same columns (Row, Type,
-Original_Value, Fixed_Value, Auto_Fixed, Description, Target_Tool,
-Country, Status, Detail, Processed_At):
+Output: <input file name>_results_<YYYYMMDD_HHMMSS>.csv - a new,
+timestamped file every run, so nothing gets overwritten. Plain CSV,
+one row per IOC (not per platform), columns:
 
-    Summary      - how many rows were Blocked/Failed/Invalid/Skipped/
-                   Would Block overall, and broken down by IOC type
-    Blocked      - only the rows that were successfully blocked
-    Not Blocked  - everything else (Failed, Invalid, Skipped, or
-                   Would Block in a dry run) - i.e. what did NOT end
-                   up blocked and may need a human look
-    All Results  - every row, unfiltered, for full traceability
+    Row, Type, Original_Value, Fixed_Value, Auto_Fixed, Description,
+    Country, Status, Detail,
+    FortiGate_DC_Status, FortiGate_DC_Detail,
+    FortiGate_DR_Status, FortiGate_DR_Detail,
+    PaloAlto_Status, PaloAlto_Detail,
+    Apex_Status, Apex_Detail,
+    Processed_At
+
+Status (the overall column) is Invalid/Skipped for a row that never
+reached any platform, Would Block in a dry run, and otherwise Blocked
+(every applicable platform succeeded), Partially Blocked (some
+succeeded, some failed), or Failed (none did) - Detail carries the
+reason for Invalid/Skipped/no-platform-configured rows.
+
+Each platform's own Status column is one of:
+    N/A            - this IOC type never goes to that platform
+                     (e.g. Apex for an IP, or Palo Alto for a DOMAIN)
+    Not Configured - applies to this IOC type, but isn't set up
+    Would Block    - dry run only
+    Blocked/Failed - an actual attempt was made; see that platform's
+                     Detail column for why
+
+So for an IP, filtering on FortiGate_DC_Status/FortiGate_DR_Status/
+PaloAlto_Status tells you exactly which of your three firewalls
+ended up with the block and which didn't, all on one line.
 """
 
 import base64
@@ -307,7 +327,8 @@ def fortigate_site_configured(site_name):
 # ============================================================
 
 PALOALTO_HOST = os.environ.get("PALOALTO_HOST", "")
-PALOALTO_API_KEY = os.environ.get("PALOALTO_API_KEY", "")
+PALOALTO_USERNAME = os.environ.get("PALOALTO_USERNAME", "")
+PALOALTO_PASSWORD = os.environ.get("PALOALTO_PASSWORD", "")
 PALOALTO_VSYS = os.environ.get("PALOALTO_VSYS", "vsys1")
 PALOALTO_IP_GROUP = os.environ.get("PALOALTO_IP_GROUP", "Blocked-IPs")
 PALOALTO_VERIFY_TLS = os.environ.get("PALOALTO_VERIFY_TLS", "false").lower() == "true"
@@ -322,7 +343,57 @@ PALOALTO_GROUP_STATIC_XPATH = PALOALTO_BASE_XPATH + "/address-group/entry[@name=
 
 
 def paloalto_configured():
-    return bool(PALOALTO_HOST and PALOALTO_API_KEY)
+    return bool(PALOALTO_HOST and PALOALTO_USERNAME and PALOALTO_PASSWORD)
+
+
+_paloalto_api_key_cache = None
+
+
+def get_paloalto_api_key(force_refresh=False):
+    """
+    Returns the PAN-OS session API key, obtained from
+    PALOALTO_USERNAME/PALOALTO_PASSWORD via the type=keygen endpoint
+    and cached for the rest of the run - PAN-OS issues one key per
+    username/password exchange, good for the whole session, so there
+    is no need (and no point) to re-authenticate on every block call.
+
+    Raises RuntimeError with a clear message if authentication fails -
+    validate_paloalto_configuration() calls this once upfront (with
+    force_refresh=True) so a bad username/password is caught before
+    any IOC is processed, not mid-run on the first Palo Alto call.
+    """
+    global _paloalto_api_key_cache
+
+    if _paloalto_api_key_cache is not None and not force_refresh:
+        return _paloalto_api_key_cache
+
+    response = requests.get(
+        f"{PALOALTO_HOST}{PALOALTO_API_PATH}",
+        params={"type": "keygen", "user": PALOALTO_USERNAME, "password": PALOALTO_PASSWORD},
+        verify=PALOALTO_VERIFY_TLS,
+        timeout=30,
+    )
+
+    try:
+        root = ET.fromstring(response.text)
+    except ET.ParseError:
+        raise RuntimeError(
+            f"Palo Alto authentication failed: HTTP {response.status_code} - non-XML response during keygen"
+        )
+
+    if root.get("status") != "success":
+        message = root.findtext(".//msg") or root.findtext(".//line") or response.text[:200]
+        raise RuntimeError(f"Palo Alto authentication failed: HTTP {response.status_code} - {message}")
+
+    key = root.findtext(".//key")
+    if not key:
+        raise RuntimeError(
+            f"Palo Alto authentication failed: HTTP {response.status_code} - "
+            "keygen succeeded but no <key> in response"
+        )
+
+    _paloalto_api_key_cache = key
+    return key
 
 
 if (
@@ -402,8 +473,9 @@ _GEOIP_CACHE = {}
 #
 # An IOC type can route to more than one platform - e.g. an IP goes to
 # FortiGate DC, FortiGate DR, AND Palo Alto, whichever of those are
-# actually configured. Each attempt gets its own row in the results
-# CSV (see process_file()).
+# actually configured. Every platform gets its own Status/Detail
+# column pair on that IOC's one row in the results CSV (see
+# process_file() and TARGET_COLUMN_PREFIX below).
 
 BASE_ROUTES = {
     "IP": ["FORTIGATE_DC", "FORTIGATE_DR", "PALOALTO"],
@@ -421,6 +493,36 @@ TARGET_LABEL = {
     "PALOALTO": "Palo Alto",
     "APEX": "Trend Micro Apex Central",
 }
+
+# Column prefix used for each platform's Status/Detail pair in the
+# results CSV - fixed iteration order (dict insertion order), which
+# is also the column order. Every known platform appears here, even
+# ones a given IOC type never routes to (those get "N/A" - see
+# process_file()).
+TARGET_COLUMN_PREFIX = {
+    "FORTIGATE_DC": "FortiGate_DC",
+    "FORTIGATE_DR": "FortiGate_DR",
+    "PALOALTO": "PaloAlto",
+    "APEX": "Apex",
+}
+
+RESULT_FIELDNAMES = (
+    [
+        "Row",
+        "Type",
+        "Original_Value",
+        "Fixed_Value",
+        "Auto_Fixed",
+        "Description",
+        "Country",
+        "Status",
+        "Detail",
+    ]
+    + [f"{prefix}_{suffix}" for prefix in TARGET_COLUMN_PREFIX.values() for suffix in ("Status", "Detail")]
+    + ["Processed_At"]
+)
+
+STATUS_KEYS = ("Blocked", "Partially Blocked", "Failed", "Invalid", "Skipped", "Would Block")
 
 
 def is_target_configured(target_key):
@@ -477,21 +579,27 @@ def validate_fortigate_site_configuration(site_name):
 
 def validate_paloalto_configuration():
     # Not configured at all is fine - Palo Alto is optional.
-    if not PALOALTO_HOST and not PALOALTO_API_KEY:
+    if not PALOALTO_HOST and not PALOALTO_USERNAME and not PALOALTO_PASSWORD:
         return
 
     missing = [
         name
         for name, value in (
             ("PALOALTO_HOST", PALOALTO_HOST),
-            ("PALOALTO_API_KEY", PALOALTO_API_KEY),
+            ("PALOALTO_USERNAME", PALOALTO_USERNAME),
+            ("PALOALTO_PASSWORD", PALOALTO_PASSWORD),
         )
         if not value
     ]
     if missing:
         raise RuntimeError(
-            "Missing Palo Alto environment variable(s): " + ", ".join(missing)
+            "Missing Palo Alto configuration value(s): " + ", ".join(missing)
         )
+
+    # Fail fast on bad credentials, before any IOC is processed - and
+    # cache the session API key for every block/commit call this run
+    # makes.
+    get_paloalto_api_key(force_refresh=True)
 
 
 def validate_platform_coverage(present_types):
@@ -985,7 +1093,7 @@ def paloalto_set_address_object(name, ip_value, comment):
     response = paloalto_request({
         "type": "config",
         "action": "set",
-        "key": PALOALTO_API_KEY,
+        "key": get_paloalto_api_key(),
         "xpath": PALOALTO_ADDRESS_XPATH.format(name=name),
         "element": build_paloalto_address_element(ip_value, comment),
     })
@@ -999,7 +1107,7 @@ def paloalto_get_group_members(group_name):
     response = paloalto_request({
         "type": "config",
         "action": "get",
-        "key": PALOALTO_API_KEY,
+        "key": get_paloalto_api_key(),
         "xpath": PALOALTO_GROUP_STATIC_XPATH.format(group=group_name),
     })
 
@@ -1023,7 +1131,7 @@ def paloalto_set_group_members(group_name, members):
     response = paloalto_request({
         "type": "config",
         "action": "set",
-        "key": PALOALTO_API_KEY,
+        "key": get_paloalto_api_key(),
         "xpath": PALOALTO_GROUP_STATIC_XPATH.format(group=group_name),
         "element": element,
     })
@@ -1076,7 +1184,7 @@ def commit_paloalto_changes():
     response = paloalto_request({
         "type": "commit",
         "cmd": "<commit></commit>",
-        "key": PALOALTO_API_KEY,
+        "key": get_paloalto_api_key(),
     })
 
     success, error = paloalto_parse_status(response)
@@ -1505,24 +1613,20 @@ def load_csv_rows(input_file):
 
 def process_row(row_number, raw_type, raw_value, description):
     """
-    Validates/auto-fixes one row and returns a base result dict (no
-    Target_Tool/Status/Detail yet - process_file() clones this once
-    per platform the IOC routes to) plus (ioc_type, fixed_value) - or
-    None as the second item if the row can't be blocked at all.
+    Validates/auto-fixes one row and returns a base result dict (every
+    per-platform Status/Detail column still blank - process_file()
+    fills those in, at most once each, as it routes the IOC) plus
+    (ioc_type, fixed_value) - or None as the second item if the row
+    can't be blocked at all.
     """
-    result = {
+    result = {field: "" for field in RESULT_FIELDNAMES}
+    result.update({
         "Row": row_number,
         "Type": raw_type,
         "Original_Value": raw_value,
-        "Fixed_Value": "",
         "Auto_Fixed": "No",
         "Description": description,
-        "Target_Tool": "",
-        "Country": "",
-        "Status": "",
-        "Detail": "",
-        "Processed_At": "",
-    }
+    })
 
     try:
         ioc_type = normalize_type(raw_type)
@@ -1549,22 +1653,9 @@ def process_row(row_number, raw_type, raw_value, description):
 # ============================================================
 # FULL RUN
 # ============================================================
-
-RESULT_FIELDNAMES = [
-    "Row",
-    "Type",
-    "Original_Value",
-    "Fixed_Value",
-    "Auto_Fixed",
-    "Description",
-    "Target_Tool",
-    "Country",
-    "Status",
-    "Detail",
-    "Processed_At",
-]
-
-STATUS_KEYS = ("Blocked", "Failed", "Invalid", "Skipped", "Would Block")
+#
+# RESULT_FIELDNAMES/STATUS_KEYS are defined earlier, alongside
+# TARGET_COLUMN_PREFIX (which RESULT_FIELDNAMES is built from).
 
 
 def compute_summary_counts(results):
@@ -1596,396 +1687,26 @@ def print_summary(results):
         print(f"  {status:<12}: {count}")
 
     print()
-    print(
-        f"{'Type':<10} {'Blocked':<10} {'Failed':<10} {'Invalid':<10} "
-        f"{'Skipped':<10} {'Would Block':<12}"
-    )
+    print(f"{'Type':<10} " + " ".join(f"{key:<17}" for key in STATUS_KEYS))
     for ioc_type, counts in sorted(by_type.items()):
-        print(
-            f"{ioc_type:<10} {counts['Blocked']:<10} {counts['Failed']:<10} "
-            f"{counts['Invalid']:<10} {counts['Skipped']:<10} {counts['Would Block']:<12}"
-        )
+        print(f"{ioc_type:<10} " + " ".join(f"{counts[key]:<17}" for key in STATUS_KEYS))
 
 
-# ============================================================
-# STDLIB .XLSX FALLBACK (used when openpyxl isn't installed)
-# ============================================================
-#
-# A minimal, hand-rolled .xlsx writer: just zipfile + string-built
-# OOXML XML, both standard library. Not a general-purpose xlsx
-# library - it implements exactly the small slice of openpyxl's API
-# that _write_detail_sheet()/_write_summary_sheet()/_autofit_columns()
-# below use (Workbook, worksheet.append(), worksheet[1]/["A1"],
-# worksheet.columns, column_dimensions[...].width, freeze_panes,
-# Font(bold=...), PatternFill(...)) so those three functions work
-# unchanged no matter which backend is active.
-
-def _stdlib_xlsx_column_letter(index):
-    """1-indexed column number -> spreadsheet column letters (1->A, 27->AA)."""
-    letters = ""
-    while index > 0:
-        index, remainder = divmod(index - 1, 26)
-        letters = chr(65 + remainder) + letters
-    return letters
 
 
-def _stdlib_xlsx_column_index(letters):
-    """Spreadsheet column letters -> 1-indexed column number (inverse of the above)."""
-    index = 0
-    for char in letters:
-        index = index * 26 + (ord(char.upper()) - 64)
-    return index
-
-
-class _StdlibXlsxFont:
-    def __init__(self, bold=False, size=11):
-        self.bold = bold
-        self.size = size
-
-
-class _StdlibXlsxPatternFill:
-    def __init__(self, start_color=None, end_color=None, fill_type=None):
-        self.start_color = start_color
-        self.fill_type = fill_type
-
-
-class _StdlibXlsxCell:
-    __slots__ = ("value", "font", "fill", "column_letter")
-
-    def __init__(self, value=None, column_letter=""):
-        self.value = value
-        self.font = None
-        self.fill = None
-        self.column_letter = column_letter
-
-
-class _StdlibXlsxColumnDimension:
-    def __init__(self):
-        self.width = None
-
-
-class _StdlibXlsxColumnDimensions(dict):
-    def __getitem__(self, key):
-        if key not in self:
-            dict.__setitem__(self, key, _StdlibXlsxColumnDimension())
-        return dict.__getitem__(self, key)
-
-
-class _StdlibXlsxWorksheet:
-    def __init__(self, title):
-        self.title = title
-        self.rows = []
-        self.freeze_panes = None
-        self.column_dimensions = _StdlibXlsxColumnDimensions()
-
-    def append(self, values):
-        self.rows.append([_StdlibXlsxCell(value, _stdlib_xlsx_column_letter(i + 1)) for i, value in enumerate(values)])
-
-    @property
-    def max_row(self):
-        return len(self.rows)
-
-    @property
-    def columns(self):
-        width = max((len(row) for row in self.rows), default=0)
-        columns = []
-        for col_index in range(width):
-            column_cells = []
-            for row in self.rows:
-                if col_index < len(row):
-                    column_cells.append(row[col_index])
-                else:
-                    column_cells.append(_StdlibXlsxCell(None, _stdlib_xlsx_column_letter(col_index + 1)))
-            columns.append(column_cells)
-        return columns
-
-    def __getitem__(self, key):
-        if isinstance(key, int):
-            return self.rows[key - 1]
-
-        letters = "".join(ch for ch in key if ch.isalpha())
-        row_number = int("".join(ch for ch in key if ch.isdigit()))
-        col_index = _stdlib_xlsx_column_index(letters) - 1
-
-        row = self.rows[row_number - 1]
-        while len(row) <= col_index:
-            row.append(_StdlibXlsxCell(None, _stdlib_xlsx_column_letter(len(row) + 1)))
-        return row[col_index]
-
-
-class _StdlibXlsxWorkbook:
-    def __init__(self):
-        self._sheets = [_StdlibXlsxWorksheet("Sheet")]
-
-    @property
-    def active(self):
-        return self._sheets[0]
-
-    def create_sheet(self, title):
-        sheet = _StdlibXlsxWorksheet(title)
-        self._sheets.append(sheet)
-        return sheet
-
-    def save(self, output_file):
-        _stdlib_xlsx_save(self._sheets, output_file)
-
-
-def _stdlib_xlsx_cell_style_key(cell):
-    bold = bool(cell.font and cell.font.bold)
-    size = cell.font.size if (cell.font and cell.font.bold) else 11
-    filled = bool(cell.fill and cell.fill.fill_type)
-    return (bold, size, filled)
-
-
-def _stdlib_xlsx_sheet_xml(worksheet, style_index):
-    column_widths = []
-    for letters, dimension in worksheet.column_dimensions.items():
-        if dimension.width:
-            column_widths.append((_stdlib_xlsx_column_index(letters), dimension.width))
-    column_widths.sort()
-
-    cols_xml = ""
-    if column_widths:
-        cols_xml = "<cols>" + "".join(
-            f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>' for index, width in column_widths
-        ) + "</cols>"
-
-    view_xml = "<sheetViews><sheetView workbookViewId=\"0\">"
-    if worksheet.freeze_panes:
-        view_xml += '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
-        view_xml += '<selection pane="bottomLeft" activeCell="A2" sqref="A2"/>'
-    view_xml += "</sheetView></sheetViews>"
-
-    rows_xml = []
-    for row_number, row in enumerate(worksheet.rows, start=1):
-        cells_xml = []
-        for cell in row:
-            if cell.value is None or cell.value == "":
-                continue
-            style_attr = f' s="{style_index[_stdlib_xlsx_cell_style_key(cell)]}"'
-            ref = f"{cell.column_letter}{row_number}"
-            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
-                cells_xml.append(f'<c r="{ref}"{style_attr}><v>{cell.value}</v></c>')
-            else:
-                text = xml_escape(str(cell.value))
-                cells_xml.append(f'<c r="{ref}" t="inlineStr"{style_attr}><is><t xml:space="preserve">{text}</t></is></c>')
-        rows_xml.append(f'<row r="{row_number}">' + "".join(cells_xml) + "</row>")
-
-    return (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        + cols_xml + view_xml + "<sheetData>" + "".join(rows_xml) + "</sheetData>"
-        "</worksheet>"
-    )
-
-
-def _stdlib_xlsx_styles_xml(style_index):
-    # style_index maps (bold, size, filled) -> cellXfs index. Index 0
-    # is always the default (no bold, size 11, no fill).
-    fonts_xml = []
-    fills_xml = ['<fill><patternFill patternType="none"/></fill>', '<fill><patternFill patternType="gray125"/></fill>']
-    xfs_xml = []
-
-    fill_id_for_filled = 2  # first two fill slots (0,1) are reserved by the xlsx spec
-    fills_xml.append('<fill><patternFill patternType="solid"><fgColor rgb="FFDDEBF7"/><bgColor indexed="64"/></patternFill></fill>')
-
-    for key, index in sorted(style_index.items(), key=lambda item: item[1]):
-        bold, size, filled = key
-        fonts_xml.append(f'<font><sz val="{size}"/><name val="Calibri"/>{"<b/>" if bold else ""}</font>')
-        fill_id = fill_id_for_filled if filled else 0
-        xfs_xml.append(
-            f'<xf numFmtId="0" fontId="{index}" fillId="{fill_id}" borderId="0" xfId="0" '
-            f'applyFont="1" applyFill="{"1" if filled else "0"}"/>'
-        )
-
-    return (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        f'<fonts count="{len(fonts_xml)}">' + "".join(fonts_xml) + "</fonts>"
-        f'<fills count="{len(fills_xml)}">' + "".join(fills_xml) + "</fills>"
-        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
-        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        f'<cellXfs count="{len(xfs_xml)}">' + "".join(xfs_xml) + "</cellXfs>"
-        "</styleSheet>"
-    )
-
-
-def _stdlib_xlsx_save(sheets, output_file):
-    import zipfile
-
-    # Collect every distinct (bold, size, filled) style combo used
-    # across all sheets, in first-seen order, and give each one a
-    # cellXfs index - referenced by each cell's s="..." attribute.
-    style_index = {(False, 11, False): 0}
-    for sheet in sheets:
-        for row in sheet.rows:
-            for cell in row:
-                key = _stdlib_xlsx_cell_style_key(cell)
-                if key not in style_index:
-                    style_index[key] = len(style_index)
-
-    content_types = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
-        + "".join(
-            f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-            for i in range(1, len(sheets) + 1)
-        )
-        + "</Types>"
-    )
-
-    root_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
-        "</Relationships>"
-    )
-
-    workbook_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        "<sheets>"
-        + "".join(
-            f'<sheet name="{xml_escape(sheet.title)}" sheetId="{i}" r:id="rId{i}"/>'
-            for i, sheet in enumerate(sheets, start=1)
-        )
-        + "</sheets></workbook>"
-    )
-
-    workbook_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        + "".join(
-            f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>'
-            for i in range(1, len(sheets) + 1)
-        )
-        + f'<Relationship Id="rId{len(sheets) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
-        "</Relationships>"
-    )
-
-    with zipfile.ZipFile(output_file, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", content_types)
-        archive.writestr("_rels/.rels", root_rels)
-        archive.writestr("xl/workbook.xml", workbook_xml)
-        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
-        archive.writestr("xl/styles.xml", _stdlib_xlsx_styles_xml(style_index))
-        for i, sheet in enumerate(sheets, start=1):
-            archive.writestr(f"xl/worksheets/sheet{i}.xml", _stdlib_xlsx_sheet_xml(sheet, style_index))
-
-
-def _xlsx_backend():
+def write_results_csv(output_file, results):
     """
-    Returns (Workbook, Font, PatternFill) - from openpyxl if it's
-    installed, otherwise from the pure-stdlib fallback above (zero
-    pip installs needed, which matters on an air-gapped machine).
-    Same three names either way, so _write_detail_sheet(),
-    _write_summary_sheet() and write_results_workbook() below never
-    need to know which backend is actually in use.
+    Writes the run's results as plain CSV, one row per IOC (not one
+    row per platform) - see RESULT_FIELDNAMES for the exact columns.
+    Plain "csv" standard library module, so there's nothing extra to
+    install even on a fully air-gapped machine.
     """
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill
+    with open(output_file, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDNAMES)
+        writer.writeheader()
+        for row in results:
+            writer.writerow({field: row.get(field, "") for field in RESULT_FIELDNAMES})
 
-        return Workbook, Font, PatternFill
-    except ImportError:
-        return _StdlibXlsxWorkbook, _StdlibXlsxFont, _StdlibXlsxPatternFill
-
-
-def _autofit_columns(worksheet):
-    for column_cells in worksheet.columns:
-        length = max((len(str(cell.value)) for cell in column_cells if cell.value is not None), default=8)
-        worksheet.column_dimensions[column_cells[0].column_letter].width = min(length + 2, 60)
-
-
-def _write_detail_sheet(worksheet, rows):
-    _, Font, PatternFill = _xlsx_backend()
-
-    header_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
-
-    worksheet.append(RESULT_FIELDNAMES)
-    for cell in worksheet[1]:
-        cell.font = Font(bold=True)
-        cell.fill = header_fill
-
-    for row in rows:
-        worksheet.append([row.get(field, "") for field in RESULT_FIELDNAMES])
-
-    worksheet.freeze_panes = "A2"
-    _autofit_columns(worksheet)
-
-
-def _write_summary_sheet(worksheet, results):
-    _, Font, PatternFill = _xlsx_backend()
-
-    header_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
-    bold = Font(bold=True)
-
-    by_status, by_type = compute_summary_counts(results)
-
-    worksheet.append(["Threat Intel IOC Blocker - Run Summary"])
-    worksheet["A1"].font = Font(bold=True, size=14)
-    worksheet.append([f"Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}"])
-    worksheet.append([f"Total rows processed: {len(results)}"])
-    worksheet.append([])
-
-    worksheet.append(["Status", "Count"])
-    for cell in worksheet[worksheet.max_row]:
-        cell.font = bold
-        cell.fill = header_fill
-    for status in STATUS_KEYS:
-        worksheet.append([status, by_status.get(status, 0)])
-    # Any status not in the known list (shouldn't normally happen) still gets counted.
-    for status, count in sorted(by_status.items()):
-        if status not in STATUS_KEYS:
-            worksheet.append([status, count])
-
-    worksheet.append([])
-
-    header_row = ["Type"] + list(STATUS_KEYS)
-    worksheet.append(header_row)
-    for cell in worksheet[worksheet.max_row]:
-        cell.font = bold
-        cell.fill = header_fill
-    for ioc_type, counts in sorted(by_type.items()):
-        worksheet.append([ioc_type] + [counts[key] for key in STATUS_KEYS])
-
-    _autofit_columns(worksheet)
-
-
-def write_results_workbook(output_file, results):
-    """
-    Writes the run's results as an .xlsx workbook with four sheets:
-        Summary      - counts by status, and by IOC type x status
-        Blocked      - every row that was successfully blocked
-        Not Blocked  - everything else (Failed/Invalid/Skipped/Would Block)
-        All Results  - every row, unfiltered (the full detail)
-
-    Uses openpyxl if it's installed, otherwise the stdlib-only
-    fallback writer above - see _xlsx_backend().
-    """
-    Workbook, _, _ = _xlsx_backend()
-
-    workbook = Workbook()
-
-    summary_sheet = workbook.active
-    summary_sheet.title = "Summary"
-    _write_summary_sheet(summary_sheet, results)
-
-    blocked_sheet = workbook.create_sheet("Blocked")
-    _write_detail_sheet(blocked_sheet, [row for row in results if row["Status"] == "Blocked"])
-
-    not_blocked_sheet = workbook.create_sheet("Not Blocked")
-    _write_detail_sheet(not_blocked_sheet, [row for row in results if row["Status"] != "Blocked"])
-
-    all_results_sheet = workbook.create_sheet("All Results")
-    _write_detail_sheet(all_results_sheet, results)
-
-    workbook.save(output_file)
 
 
 def process_file(input_file, dry_run):
@@ -2079,40 +1800,68 @@ def process_file(input_file, dry_run):
                 print(f"  Country: {country}")
 
         # An IOC type can route to more than one platform (e.g. an IP
-        # goes to FortiGate DC, FortiGate DR, and Palo Alto) - each
-        # attempt below gets its own row in the results CSV. In dry
-        # run, show every platform the type *could* go to, even ones
-        # not currently configured, so the preview is complete.
-        targets = BASE_ROUTES.get(ioc_type, []) if dry_run else targets_for_type(ioc_type)
+        # goes to FortiGate DC, FortiGate DR, and Palo Alto) - every
+        # platform known to this tool gets its own Status/Detail
+        # column pair on this one row (see TARGET_COLUMN_PREFIX):
+        # "N/A" if this IOC type never goes there, "Not Configured"
+        # if it does but isn't set up, otherwise the actual attempt.
+        applicable_targets = BASE_ROUTES.get(ioc_type, [])
 
-        if not targets:
-            row = dict(base_result)
-            row["Status"] = "Failed"
-            row["Detail"] = f"No configured platform for type {ioc_type}"
-            print(f"  FAILED - {row['Detail']}")
-            results.append(row)
+        if not applicable_targets:
+            base_result["Status"] = "Failed"
+            base_result["Detail"] = f"No platform exists for type {ioc_type}"
+            print(f"  FAILED - {base_result['Detail']}")
+            results.append(base_result)
             continue
 
-        for target in targets:
-            row = dict(base_result)
-            row["Target_Tool"] = TARGET_LABEL[target]
+        attempted_any = False
+        any_success = False
+        any_failure = False
+
+        for target, prefix in TARGET_COLUMN_PREFIX.items():
+            status_key = f"{prefix}_Status"
+            detail_key = f"{prefix}_Detail"
+
+            if target not in applicable_targets:
+                base_result[status_key] = "N/A"
+                continue
 
             if dry_run:
-                row["Status"] = "Would Block"
-                row["Detail"] = f"Would send to {row['Target_Tool']}"
-                print(f"  {row['Detail']}")
-                results.append(row)
+                base_result[status_key] = "Would Block"
+                base_result[detail_key] = f"Would send to {TARGET_LABEL[target]}"
+                print(f"  {base_result[detail_key]}")
+                attempted_any = True
+                continue
+
+            if not is_target_configured(target):
+                base_result[status_key] = "Not Configured"
                 continue
 
             comment = (description or DEFAULT_NOTE) if target == "APEX" else description
             success, detail = BLOCK_FUNCTIONS[target](ioc_type, fixed_value, comment)
 
-            row["Status"] = "Blocked" if success else "Failed"
-            row["Detail"] = detail
+            base_result[status_key] = "Blocked" if success else "Failed"
+            base_result[detail_key] = detail
+            attempted_any = True
+            any_success = any_success or success
+            any_failure = any_failure or not success
 
-            print(f"  [{row['Target_Tool']}] [{'BLOCKED' if success else 'FAILED'}] {detail}")
+            print(f"  [{TARGET_LABEL[target]}] [{'BLOCKED' if success else 'FAILED'}] {detail}")
 
-            results.append(row)
+        if dry_run:
+            base_result["Status"] = "Would Block"
+        elif not attempted_any:
+            base_result["Status"] = "Failed"
+            base_result["Detail"] = f"No configured platform for type {ioc_type}"
+            print(f"  FAILED - {base_result['Detail']}")
+        elif any_success and any_failure:
+            base_result["Status"] = "Partially Blocked"
+        elif any_success:
+            base_result["Status"] = "Blocked"
+        else:
+            base_result["Status"] = "Failed"
+
+        results.append(base_result)
 
     if not dry_run:
         commit_result = commit_paloalto_changes()
@@ -2128,8 +1877,8 @@ def process_file(input_file, dry_run):
                 print("committed - review and commit manually via the Palo Alto UI/CLI.")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = f"{os.path.splitext(input_file)[0]}_results_{timestamp}.xlsx"
-    write_results_workbook(output_file, results)
+    output_file = f"{os.path.splitext(input_file)[0]}_results_{timestamp}.csv"
+    write_results_csv(output_file, results)
 
     print_summary(results)
 
@@ -2169,7 +1918,8 @@ def show_configuration():
     print("Palo Alto")
     print("-" * 40)
     print("Host:", PALOALTO_HOST or "NOT SET")
-    print("API Key:", "SET" if PALOALTO_API_KEY else "NOT SET")
+    print("Username:", PALOALTO_USERNAME or "NOT SET")
+    print("Password:", "SET" if PALOALTO_PASSWORD else "NOT SET")
     print("Vsys:", PALOALTO_VSYS)
     print("IP block group:", PALOALTO_IP_GROUP)
     print("TLS verification:", PALOALTO_VERIFY_TLS)
