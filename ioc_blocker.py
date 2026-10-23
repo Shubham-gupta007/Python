@@ -339,7 +339,10 @@ PALOALTO_BASE_XPATH = (
     f"/vsys/entry[@name='{PALOALTO_VSYS}']"
 )
 PALOALTO_ADDRESS_XPATH = PALOALTO_BASE_XPATH + "/address/entry[@name='{name}']"
-PALOALTO_GROUP_STATIC_XPATH = PALOALTO_BASE_XPATH + "/address-group/entry[@name='{group}']/static"
+# Points at the address-group ENTRY itself, not its /static child - see
+# paloalto_add_group_member()/paloalto_remove_group_member() below for why
+# that distinction matters.
+PALOALTO_GROUP_XPATH = PALOALTO_BASE_XPATH + "/address-group/entry[@name='{group}']"
 
 
 def paloalto_configured():
@@ -1103,37 +1106,58 @@ def paloalto_set_address_object(name, ip_value, comment):
     return success, error, response
 
 
-def paloalto_get_group_members(group_name):
-    response = paloalto_request({
-        "type": "config",
-        "action": "get",
-        "key": get_paloalto_api_key(),
-        "xpath": PALOALTO_GROUP_STATIC_XPATH.format(group=group_name),
-    })
+def paloalto_add_group_member(group_name, member_name):
+    """
+    Adds one member to a static address group.
 
-    try:
-        root = ET.fromstring(response.text)
-    except ET.ParseError:
-        return None, f"HTTP {response.status_code} - non-XML response from Palo Alto"
+    Deliberately targets the group's own xpath (PALOALTO_GROUP_XPATH)
+    rather than its /static child directly, and sends only the one
+    new member rather than the whole rebuilt member list. PAN-OS's
+    "set" action merges a <static><member>...</member></static>
+    fragment into whatever members already exist under that entry -
+    it does not replace the list - so this is naturally idempotent
+    (setting an already-present member is a harmless no-op) and never
+    needs a prior GET.
 
-    if root.get("status") != "success":
-        message = root.findtext(".//msg") or response.text[:200]
-        return None, f"could not read group '{group_name}' (does it exist?): {message}"
-
-    members = [member.text for member in root.findall(".//member") if member.text]
-
-    return members, None
-
-
-def paloalto_set_group_members(group_name, members):
-    element = "<static>" + "".join(f"<member>{xml_escape(m)}</member>" for m in members) + "</static>"
+    This matches Splunk's own official "Palo Alto Networks Firewall"
+    SOAR connector (_block_ip/_add_address in
+    paloaltonetworksfirewall_connector.py, ADDR_GRP_XPATH/ADDR_GRP_ELEM
+    in paloaltonetworksfirewall_consts.py). The previous approach here
+    - GET the current members, then "set" the entire /static subtree
+    with the full rebuilt list - replaces that whole node instead of
+    merging into it, which on at least some PAN-OS versions/configs
+    fails with "set failed, may need to override template object
+    first" even against a perfectly normal, directly-editable static
+    group.
+    """
+    element = f"<static><member>{xml_escape(member_name)}</member></static>"
 
     response = paloalto_request({
         "type": "config",
         "action": "set",
         "key": get_paloalto_api_key(),
-        "xpath": PALOALTO_GROUP_STATIC_XPATH.format(group=group_name),
+        "xpath": PALOALTO_GROUP_XPATH.format(group=group_name),
         "element": element,
+    })
+
+    return paloalto_parse_status(response)
+
+
+def paloalto_remove_group_member(group_name, member_name):
+    """
+    Removes one member from a static address group by deleting that
+    exact <member> node directly (an xpath predicate), instead of
+    rewriting the whole member list - same reasoning as
+    paloalto_add_group_member() above, and matching the official
+    connector's _unblock_ip (DEL_ADDR_GRP_XPATH).
+    """
+    xpath = PALOALTO_GROUP_XPATH.format(group=group_name) + f"/static/member[text()='{member_name}']"
+
+    response = paloalto_request({
+        "type": "config",
+        "action": "delete",
+        "key": get_paloalto_api_key(),
+        "xpath": xpath,
     })
 
     return paloalto_parse_status(response)
@@ -1151,22 +1175,14 @@ def block_via_paloalto(ioc_type, value, comment):
     if not success:
         return False, f"HTTP {response.status_code} - address object failed: {error}"
 
-    members, get_error = paloalto_get_group_members(PALOALTO_IP_GROUP)
+    group_success, group_error = paloalto_add_group_member(PALOALTO_IP_GROUP, value)
 
-    if members is None:
-        return False, f"HTTP {response.status_code} - address object ok, {get_error}"
-
-    if value in members:
-        detail = f"HTTP {response.status_code} - address object created/updated, already a member of group '{PALOALTO_IP_GROUP}'"
-    else:
-        group_success, group_error = paloalto_set_group_members(PALOALTO_IP_GROUP, members + [value])
-
-        if not group_success:
-            return False, f"HTTP {response.status_code} - address object ok, group update failed: {group_error}"
-
-        detail = f"HTTP {response.status_code} - address object created/updated, added to group '{PALOALTO_IP_GROUP}'"
+    if not group_success:
+        return False, f"HTTP {response.status_code} - address object ok, group update failed: {group_error}"
 
     _paloalto_pending_commit = True
+
+    detail = f"HTTP {response.status_code} - address object created/updated, added to group '{PALOALTO_IP_GROUP}'"
 
     return True, detail + " (staged, pending commit)"
 
