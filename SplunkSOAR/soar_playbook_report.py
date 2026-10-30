@@ -6,14 +6,11 @@ Pulls playbook run history from the Splunk SOAR REST API for a list of
 playbooks, writes a CSV with the number of executions and the success rate
 of each one, and emails the CSV over SMTP.
 
-Usage:
-    python soar_playbook_report.py --config config.json
-    python soar_playbook_report.py --config config.json --days 30 --no-email
-    python soar_playbook_report.py --config config.json --playbooks local/pb_one community/pb_two
-
-Secrets can be kept out of the config file with environment variables:
-    SOAR_AUTH_TOKEN   ph-auth-token of a SOAR automation user
-    SMTP_PASSWORD     password for the SMTP login
+Uses only the Python standard library. Edit the CONFIGURATION section below,
+then run:
+    python soar_playbook_report.py
+    python soar_playbook_report.py --days 30 --no-email
+    python soar_playbook_report.py --playbooks local/pb_one community/pb_two
 """
 
 import argparse
@@ -29,9 +26,50 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from html import escape
 from itertools import chain
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-import requests
-import urllib3
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# ---- Splunk SOAR ------------------------------------------------------------
+SOAR_BASE_URL = "https://soar.example.com"
+# ph-auth-token of a SOAR automation user.
+# Leave empty to read it from the SOAR_AUTH_TOKEN environment variable.
+SOAR_AUTH_TOKEN = ""
+# True, False (self-signed certificate; not recommended) or a path to a CA bundle file.
+SOAR_VERIFY_SSL = True
+SOAR_TIMEOUT = 60        # seconds per request
+SOAR_PAGE_SIZE = 500     # records fetched per page
+
+# Playbooks to report on. "repo/name" picks one repo; a bare "name" matches
+# that name in every repo and combines their runs into one row.
+PLAYBOOKS = [
+    "local/phishing_investigate_and_respond",
+    "community/ip_reputation_lookup",
+    "malware_triage",
+]
+LOOKBACK_DAYS = 7        # report window in days
+OUTPUT_DIR = "reports"   # folder the CSV is written to
+
+# ---- SMTP -------------------------------------------------------------------
+SMTP_HOST = "smtp.example.com"
+SMTP_PORT = 587
+SMTP_USE_TLS = True      # STARTTLS, usually port 587
+SMTP_USE_SSL = False     # implicit SSL, usually port 465 (takes priority over SMTP_USE_TLS)
+SMTP_USERNAME = "soar-reports@example.com"   # "" if the server needs no login
+# Leave empty to read it from the SMTP_PASSWORD environment variable.
+SMTP_PASSWORD = ""
+SMTP_TIMEOUT = 60
+
+EMAIL_FROM = "soar-reports@example.com"
+EMAIL_TO = ["soc-team@example.com"]
+EMAIL_CC = []
+EMAIL_SUBJECT = "Splunk SOAR Playbook Execution Report"
+
+# =============================================================================
 
 log = logging.getLogger("soar_playbook_report")
 
@@ -50,28 +88,50 @@ CSV_COLUMNS = [
 COMPLETED_STATUSES = ("success", "failed")
 
 
+def soar_auth_token():
+    return SOAR_AUTH_TOKEN or os.environ.get("SOAR_AUTH_TOKEN", "")
+
+
+def smtp_password():
+    return SMTP_PASSWORD or os.environ.get("SMTP_PASSWORD", "")
+
+
 class SoarClient:
     """Minimal Splunk SOAR REST client authenticated with a ph-auth-token."""
 
     def __init__(self, base_url, auth_token, verify_ssl=True, timeout=60, page_size=500):
         self.base_url = base_url.rstrip("/")
+        self.auth_token = auth_token
         self.timeout = timeout
         self.page_size = page_size
-        self.session = requests.Session()
-        self.session.headers.update({"ph-auth-token": auth_token, "Accept": "application/json"})
-        # verify_ssl may be True, False, or a path to a CA bundle.
-        self.session.verify = verify_ssl
-        if verify_ssl is False:
-            log.warning("TLS certificate verification is disabled for SOAR requests")
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        if isinstance(verify_ssl, str):
+            self.ssl_context = ssl.create_default_context(cafile=verify_ssl)
+        else:
+            self.ssl_context = ssl.create_default_context()
+            if not verify_ssl:
+                log.warning("TLS certificate verification is disabled for SOAR requests")
+                self.ssl_context.check_hostname = False
+                self.ssl_context.verify_mode = ssl.CERT_NONE
 
     def get(self, endpoint, params=None):
         url = f"{self.base_url}/rest/{endpoint.lstrip('/')}"
-        resp = self.session.get(url, params=params, timeout=self.timeout)
-        if resp.status_code == 401:
-            raise RuntimeError("SOAR rejected the auth token (HTTP 401); check the ph-auth-token")
-        resp.raise_for_status()
-        return resp.json()
+        if params:
+            url += "?" + urlencode(params)
+        req = Request(url, headers={"ph-auth-token": self.auth_token, "Accept": "application/json"})
+        try:
+            with urlopen(req, timeout=self.timeout, context=self.ssl_context) as resp:
+                body = resp.read().decode("utf-8")
+        except HTTPError as e:
+            if e.code == 401:
+                raise RuntimeError("SOAR rejected the auth token (HTTP 401); check the ph-auth-token")
+            detail = e.read().decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"SOAR request failed with HTTP {e.code} for {url}: {detail}")
+        except URLError as e:
+            raise RuntimeError(f"Could not reach SOAR at {self.base_url}: {e.reason}")
+        try:
+            return json.loads(body)
+        except ValueError:
+            raise RuntimeError(f"SOAR returned a non-JSON response for {url}")
 
     def get_all(self, endpoint, params=None):
         """Yield every record of a list endpoint, following SOAR's 0-based paging."""
@@ -187,9 +247,8 @@ def overall_summary(rows):
     return f"{total} runs across {len(rows)} playbooks, overall success rate {rate}"
 
 
-def build_email(smtp_cfg, rows, csv_path, period):
+def build_email(rows, csv_path, period):
     summary = overall_summary(rows)
-    subject = f"{smtp_cfg.get('subject', 'Splunk SOAR Playbook Execution Report')} ({period})"
 
     text_lines = [f"Splunk SOAR playbook execution report for {period}", summary, ""]
     for r in rows:
@@ -224,11 +283,11 @@ The full report is attached as CSV.</p>
 """
 
     msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = smtp_cfg["from"]
-    msg["To"] = ", ".join(smtp_cfg["to"])
-    if smtp_cfg.get("cc"):
-        msg["Cc"] = ", ".join(smtp_cfg["cc"])
+    msg["Subject"] = f"{EMAIL_SUBJECT} ({period})"
+    msg["From"] = EMAIL_FROM
+    msg["To"] = ", ".join(EMAIL_TO)
+    if EMAIL_CC:
+        msg["Cc"] = ", ".join(EMAIL_CC)
     msg.set_content("\n".join(text_lines))
     msg.add_alternative(html, subtype="html")
     with open(csv_path, "rb") as f:
@@ -236,58 +295,46 @@ The full report is attached as CSV.</p>
     return msg
 
 
-def send_email(smtp_cfg, msg):
-    host = smtp_cfg["host"]
-    port = int(smtp_cfg.get("port", 587))
-    timeout = int(smtp_cfg.get("timeout", 60))
+def send_email(msg):
     context = ssl.create_default_context()
-
-    if smtp_cfg.get("use_ssl"):
-        server = smtplib.SMTP_SSL(host, port, context=context, timeout=timeout)
+    if SMTP_USE_SSL:
+        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=SMTP_TIMEOUT)
     else:
-        server = smtplib.SMTP(host, port, timeout=timeout)
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT)
 
     with server:
-        if not smtp_cfg.get("use_ssl") and smtp_cfg.get("use_tls", True):
+        if not SMTP_USE_SSL and SMTP_USE_TLS:
             server.starttls(context=context)
-        if smtp_cfg.get("username"):
-            server.login(smtp_cfg["username"], smtp_cfg.get("password") or "")
+        if SMTP_USERNAME:
+            server.login(SMTP_USERNAME, smtp_password())
         # send_message delivers to every address in the To and Cc headers.
         server.send_message(msg)
 
 
-def load_config(path):
-    with open(path, encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    soar = cfg.setdefault("soar", {})
-    soar["auth_token"] = os.environ.get("SOAR_AUTH_TOKEN") or soar.get("auth_token")
-    smtp = cfg.setdefault("smtp", {})
-    smtp["password"] = os.environ.get("SMTP_PASSWORD") or smtp.get("password")
-
-    if not soar.get("base_url"):
-        raise ValueError("soar.base_url is missing from the config")
-    if not soar.get("auth_token"):
-        raise ValueError("SOAR auth token missing: set soar.auth_token or the SOAR_AUTH_TOKEN env var")
-    return cfg
-
-
-def validate_smtp(smtp_cfg):
-    missing = [k for k in ("host", "from", "to") if not smtp_cfg.get(k)]
-    if missing:
-        raise ValueError(f"smtp config is missing: {', '.join(missing)}")
-    if isinstance(smtp_cfg["to"], str):
-        smtp_cfg["to"] = [smtp_cfg["to"]]
-    if isinstance(smtp_cfg.get("cc"), str):
-        smtp_cfg["cc"] = [smtp_cfg["cc"]]
+def check_config(playbook_names, send_mail):
+    problems = []
+    if not SOAR_BASE_URL:
+        problems.append("SOAR_BASE_URL is empty")
+    if not soar_auth_token():
+        problems.append("SOAR auth token missing: set SOAR_AUTH_TOKEN at the top of the script or as an env var")
+    if not playbook_names:
+        problems.append("no playbooks given: fill in PLAYBOOKS or pass --playbooks")
+    if send_mail:
+        if not SMTP_HOST:
+            problems.append("SMTP_HOST is empty")
+        if not EMAIL_FROM:
+            problems.append("EMAIL_FROM is empty")
+        if not EMAIL_TO:
+            problems.append("EMAIL_TO is empty")
+    if problems:
+        raise ValueError("Configuration problem: " + "; ".join(problems))
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Splunk SOAR playbook execution / success-rate report")
-    parser.add_argument("-c", "--config", default="config.json", help="path to the JSON config file")
-    parser.add_argument("--days", type=int, help="look-back window in days (overrides lookback_days)")
-    parser.add_argument("--playbooks", nargs="+", help="playbook names to report on (overrides the config list)")
-    parser.add_argument("--output", help="CSV output path (default: <output_dir>/soar_playbook_report_<timestamp>.csv)")
+    parser.add_argument("--days", type=int, help="look-back window in days (overrides LOOKBACK_DAYS)")
+    parser.add_argument("--playbooks", nargs="+", help="playbook names to report on (overrides PLAYBOOKS)")
+    parser.add_argument("--output", help="CSV output path (default: OUTPUT_DIR/soar_playbook_report_<timestamp>.csv)")
     parser.add_argument("--no-email", action="store_true", help="only write the CSV, don't send it")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return parser.parse_args(argv)
@@ -301,41 +348,34 @@ def main(argv=None):
     )
 
     try:
-        cfg = load_config(args.config)
-        playbook_names = args.playbooks or cfg.get("playbooks") or []
-        if not playbook_names:
-            raise ValueError("No playbooks given: add a \"playbooks\" list to the config or pass --playbooks")
-        if not args.no_email:
-            validate_smtp(cfg["smtp"])
+        playbook_names = args.playbooks or PLAYBOOKS
+        check_config(playbook_names, send_mail=not args.no_email)
 
-        days = args.days or int(cfg.get("lookback_days", 7))
+        days = args.days or LOOKBACK_DAYS
         now = datetime.now(timezone.utc)
         since = now - timedelta(days=days)
         period = f"{since:%Y-%m-%d %H:%M} to {now:%Y-%m-%d %H:%M} UTC"
 
-        soar = cfg["soar"]
         client = SoarClient(
-            soar["base_url"],
-            soar["auth_token"],
-            verify_ssl=soar.get("verify_ssl", True),
-            timeout=int(soar.get("timeout", 60)),
-            page_size=int(soar.get("page_size", 500)),
+            SOAR_BASE_URL,
+            soar_auth_token(),
+            verify_ssl=SOAR_VERIFY_SSL,
+            timeout=SOAR_TIMEOUT,
+            page_size=SOAR_PAGE_SIZE,
         )
         rows = build_report_rows(client, playbook_names, since)
 
-        csv_path = args.output or os.path.join(
-            cfg.get("output_dir", "reports"), f"soar_playbook_report_{now:%Y%m%d_%H%M%S}.csv"
-        )
+        csv_path = args.output or os.path.join(OUTPUT_DIR, f"soar_playbook_report_{now:%Y%m%d_%H%M%S}.csv")
         write_csv(rows, csv_path)
         log.info("Report written to %s (%s)", csv_path, overall_summary(rows))
 
         if args.no_email:
             return 0
-        send_email(cfg["smtp"], build_email(cfg["smtp"], rows, csv_path, period))
-        log.info("Report emailed to %s", ", ".join(cfg["smtp"]["to"] + (cfg["smtp"].get("cc") or [])))
+        send_email(build_email(rows, csv_path, period))
+        log.info("Report emailed to %s", ", ".join(EMAIL_TO + EMAIL_CC))
         return 0
 
-    except (ValueError, RuntimeError, OSError, requests.RequestException, smtplib.SMTPException) as e:
+    except (ValueError, RuntimeError, OSError, smtplib.SMTPException) as e:
         log.error("%s", e)
         return 1
 
