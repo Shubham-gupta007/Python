@@ -1,0 +1,28 @@
+{
+  "soar": {
+    "base_url": "https://soar.example.com",
+    "auth_token": "",
+    "verify_ssl": true,
+    "timeout": 60,
+    "page_size": 500
+  },
+  "playbooks": [
+    "local/phishing_investigate_and_respond",
+    "community/ip_reputation_lookup",
+    "malware_triage"
+  ],
+  "lookback_days": 7,
+  "output_dir": "reports",
+  "smtp": {
+    "host": "smtp.example.com",
+    "port": 587,
+    "use_tls": true,
+    "use_ssl": false,
+    "username": "soar-reports@example.com",
+    "password": "",
+    "from": "soar-reports@example.com",
+    "to": ["soc-team@example.com"],
+    "cc": [],
+    "subject": "Splunk SOAR Playbook Execution Report"
+  }
+}
