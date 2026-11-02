@@ -15,6 +15,7 @@ install anything with `pip`.
 |---|---|
 | Event ID | The SOAR event (container) the playbook ran on |
 | Playbook | Name as listed in `PLAYBOOKS` |
+| Playbook Version | Version of the playbook that ran (SOAR's playbook `version`) |
 | Run ID | The playbook run's ID |
 | Status | `success`, `failed`, `running`, ... |
 | Start Time (UTC) / End Time (UTC) | When the run started and finished (blank while running) |
@@ -26,13 +27,26 @@ install anything with `pip`.
 |---|---|
 | Playbook | Name as listed in `PLAYBOOKS` (`name` or `repo/name`) |
 | Events | Number of distinct events the playbook ran on |
-| Total Runs | Runs started inside the time range |
+| Total Runs | Runs started inside the time range, across all versions of the playbook |
 | Succeeded / Failed | Runs with status `success` / `failed` |
 | In Progress / Other | Runs that have not finished yet (for example `running`) |
 | Success Rate (%) | `succeeded / (succeeded + failed) * 100`. Unfinished runs are left out |
 | Avg Duration (s) | Average run time of finished runs |
 | Last Run (UTC) | Start time of the most recent run |
-| Notes | For example "Playbook not found" or "Combined N playbooks with this name" |
+| Notes | For example "Playbook not found", or the playbook IDs/versions the runs came from |
+
+### Playbook versions
+
+Each time a playbook is saved, SOAR stores the new version as a separate
+playbook record with its own ID. The playbook's `version` field counts the
+saves. Each run is recorded against the ID of the version that ran. For
+example, `createTicket_prod` at version 118 can have runs under six
+different playbook IDs in one month.
+
+So the script doesn't count by a single playbook ID. It downloads every run in
+the time window, looks up each run's playbook ID once (`/rest/playbook/<id>`)
+to get its name and repo, and counts every version whose name matches an entry
+in `PLAYBOOKS`.
 
 The email has the summary table in its body and the workbook attached. The
 workbook is written with the standard library (`zipfile`), so it needs no
@@ -103,35 +117,30 @@ command-line options. The report is saved as
 The script exits with code 1 on any error (bad token, SOAR unreachable, SMTP
 failure, and so on), so a scheduler can catch the failure.
 
-## Counts lower than expected
+## Counts different from what you expect
 
-The report counts runs whose `playbook` field is one of the playbook IDs found
-for the names in `PLAYBOOKS`, and whose start time is inside the window. Runs
-that miss either condition are left out without an error. The usual reasons:
-
-1. **The time window isn't the one you meant.** Check the
-   `Reporting on runs started from ... to ... UTC` log line. `END_TIME` may
-   still hold an old value, or your times are local but the script reads them
-   as UTC.
-2. **The runs belong to another playbook ID.** For example, the playbook was
-   deleted and imported again, or copied. Or it's in another repo than the one
-   in `repo/name`, or its name differs in capital letters (names must match
-   exactly).
-3. **The other count includes other things.** For example, child playbooks
-   started by your playbook (they have their own name and ID), or action runs.
-
-To see which applies, set `DEBUG = True` and run the script. Among other
-things, it logs:
+Set `DEBUG = True` and run the script. It logs each REST request, then every
+playbook ID with runs in the window, with its name, version, run count, and
+whether it was counted:
 
 ```
-'local/phishing' -> playbook id 10 (local/phishing, version 3, active True): 14 runs in the window, 950 runs all time
-Runs in the window for ALL playbooks: 132
-  playbook id 10     local/phishing                                     14 runs
-  playbook id 99     (playbook record not found - deleted or no access) 104 runs
+Runs in the window for ALL playbooks: 330
+  playbook id 291    local/createTicket_prod (version 116)        30 runs  -> counted as local/createTicket_prod
+  playbook id 343    local/createTicket_prod (version 118)        15 runs  -> counted as local/createTicket_prod
+  playbook id 290    local/createTicket (version 4)                3 runs  (not in PLAYBOOKS)
 ```
 
-Every playbook ID with runs in the window is listed. Any ID not in your report
-is where the missing runs are. Add its name to `PLAYBOOKS`, or fix the window.
+Reasons a playbook shows `(not in PLAYBOOKS)`:
+
+- Its name differs from the `PLAYBOOKS` entry. Names must match exactly,
+  including capital letters, spaces and characters like `|`.
+- It's in a different repo from the one given in `repo/name`.
+- It's a child playbook. Child playbooks have their own name.
+
+Check the window too: the `Reporting on runs started from ... to ... UTC` log
+line shows the exact range. Runs of a playbook whose record has been deleted
+can't be matched to a name. They're listed as
+`(playbook record not found - deleted or no access)`.
 
 If SOAR ever says it has more records than were downloaded, the script logs
 `SOAR reported N playbook_run records but M were downloaded`.
@@ -147,11 +156,15 @@ covers the last `LOOKBACK_DAYS` days.
 
 ## REST endpoints used
 
-- `GET /rest/scm?_filter_name="<repo>"`: resolves a repo name to its id
-- `GET /rest/playbook?_filter_name="<name>"&_filter_scm=<id>`: resolves a playbook to its id(s)
-- `GET /rest/playbook_run?_filter_playbook=<id>&_filter_start_time__gte="<start>"&_filter_start_time__lte="<end>"`:
-  run history, read page by page (`page`, `page_size`). Each run's `container`
-  field is the event ID
+- `GET /rest/playbook_run?_filter_start_time__gte="<start>"&_filter_start_time__lte="<end>"`:
+  every run in the window, read page by page (`page`, `page_size`). Each run's
+  `playbook` field is the ID of the playbook version that ran. Its `container`
+  field is the event ID.
+- `GET /rest/playbook/<id>`: name, repo and version of each playbook ID found in
+  those runs (one request per ID)
+- `GET /rest/scm`: repo names, to match `repo/name` entries
+- `GET /rest/playbook?_filter_name="<name>"&_filter_scm=<id>`: only for a
+  configured playbook with no runs, to tell "not found" apart from "no runs"
 
 The script counts statuses itself, so it does not depend on the server
 filtering by status.

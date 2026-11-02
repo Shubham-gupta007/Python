@@ -66,9 +66,9 @@ LOOKBACK_DAYS = 7
 # ---- Output -----------------------------------------------------------------
 OUTPUT_DIR = "reports"   # folder the .xlsx report is written to
 SEND_EMAIL = True        # False = only write the report file, don't email it
-# True = also log which playbook IDs SOAR has runs for in the time window, the
-# exact REST requests, and how many runs each playbook has in total. Use it when
-# the counts in the report differ from what you see in SOAR.
+# True = also log the exact REST requests and, for every playbook ID with runs in
+# the time window, its name, version, run count and whether it was counted. Use it
+# when the counts in the report differ from what you see in SOAR.
 DEBUG = False
 
 # ---- SMTP -------------------------------------------------------------------
@@ -94,6 +94,7 @@ EXECUTION_SHEET = "Event Executions"
 EXECUTION_COLUMNS = [
     "Event ID",
     "Playbook",
+    "Playbook Version",
     "Run ID",
     "Status",
     "Start Time (UTC)",
@@ -129,6 +130,14 @@ def smtp_password():
     return SMTP_PASSWORD or os.environ.get("SMTP_PASSWORD", "")
 
 
+class SoarHTTPError(RuntimeError):
+    """SOAR answered with an HTTP error status."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 class SoarClient:
     """Minimal Splunk SOAR REST client authenticated with a ph-auth-token."""
 
@@ -157,9 +166,9 @@ class SoarClient:
                 body = resp.read().decode("utf-8")
         except HTTPError as e:
             if e.code == 401:
-                raise RuntimeError("SOAR rejected the auth token (HTTP 401); check the ph-auth-token")
+                raise SoarHTTPError(401, "SOAR rejected the auth token (HTTP 401); check the ph-auth-token")
             detail = e.read().decode("utf-8", errors="replace")[:300]
-            raise RuntimeError(f"SOAR request failed with HTTP {e.code} for {url}: {detail}")
+            raise SoarHTTPError(e.code, f"SOAR request failed with HTTP {e.code} for {url}: {detail}")
         except URLError as e:
             raise RuntimeError(f"Could not reach SOAR at {self.base_url}: {e.reason}")
         try:
@@ -185,12 +194,17 @@ class SoarClient:
         if body.get("count") is not None and fetched != body["count"]:
             log.warning("SOAR reported %s %s records but %s were downloaded", body["count"], endpoint, fetched)
 
-    def count(self, endpoint, params=None):
-        """Number of records SOAR has for a list query, without downloading them."""
-        return self.get(endpoint, {**(params or {}), "page_size": 1, "page": 0}).get("count")
+    def playbook(self, playbook_id):
+        """The playbook record for an id (any version), or None if SOAR no longer has it."""
+        try:
+            return self.get(f"playbook/{playbook_id}")
+        except SoarHTTPError as e:
+            if e.code in (403, 404):
+                return None
+            raise
 
     def find_playbooks(self, full_name):
-        """Return playbook records matching "name" or "repo/name" (e.g. "local/my_playbook")."""
+        """Return the current playbook record(s) matching "name" or "repo/name" (e.g. "local/my_playbook")."""
         repo, _, name = full_name.strip().rpartition("/")
         # String filter values must be double-quoted, which json.dumps does (with escaping).
         params = {"_filter_name": json.dumps(name)}
@@ -202,10 +216,6 @@ class SoarClient:
             params["_filter_scm"] = scms[0]["id"]
         return list(self.get_all("playbook", params))
 
-    def playbook_runs(self, playbook_id, start, end):
-        """Yield the runs of one playbook that started between `start` and `end` (UTC, inclusive)."""
-        return self.get_all("playbook_run", {"_filter_playbook": playbook_id, **time_filter(start, end)})
-
 
 def time_filter(start, end):
     """SOAR filter for runs whose start_time is between `start` and `end` (UTC, inclusive)."""
@@ -214,36 +224,6 @@ def time_filter(start, end):
         # .999999 so an END_TIME like 23:59:59 also includes runs during that last second.
         "_filter_start_time__lte": json.dumps(end.strftime("%Y-%m-%dT%H:%M:%S") + ".999999"),
     }
-
-
-def log_diagnostics(client, playbook_names, start, end):
-    """DEBUG = True: log what SOAR has, to explain counts that differ from what you expect."""
-    log.debug("Time window sent to SOAR (UTC): %s to %s", fmt_time(start), fmt_time(end))
-    scm_names = {s["id"]: s["name"] for s in client.get_all("scm")}
-
-    for full_name in playbook_names:
-        playbooks = client.find_playbooks(full_name)
-        if not playbooks:
-            log.debug("%r: no playbook with this exact name (names are case-sensitive)", full_name)
-        for pb in playbooks:
-            log.debug(
-                "%r -> playbook id %s (%s/%s, version %s, active %s): %s runs in the window, %s runs all time",
-                full_name, pb["id"], scm_names.get(pb.get("scm"), "?"), pb.get("name"), pb.get("version"),
-                pb.get("active"), client.count("playbook_run", {"_filter_playbook": pb["id"], **time_filter(start, end)}),
-                client.count("playbook_run", {"_filter_playbook": pb["id"]}),
-            )
-
-    # Every run in the window, whichever playbook it belongs to. Runs counted here
-    # under a playbook id you didn't expect explain a lower count in the report.
-    per_playbook = Counter(run.get("playbook") for run in client.get_all("playbook_run", time_filter(start, end)))
-    log.debug("Runs in the window for ALL playbooks: %s", sum(per_playbook.values()))
-    for pb_id, runs in per_playbook.most_common():
-        try:
-            pb = client.get(f"playbook/{pb_id}")
-            name = f"{scm_names.get(pb.get('scm'), '?')}/{pb.get('name')}"
-        except RuntimeError:
-            name = "(playbook record not found - deleted or no access)"
-        log.debug("  playbook id %-6s %-50s %s runs", pb_id, name, runs)
 
 
 # ---- Time handling ----------------------------------------------------------
@@ -288,7 +268,7 @@ def fmt_time(dt):
 
 # ---- Report building --------------------------------------------------------
 
-def execution_row(playbook_name, run):
+def execution_row(playbook_name, playbook_version, run):
     """One row of the Event Executions sheet."""
     status = (run.get("status") or "unknown").lower()
     started = parse_time(run.get("start_time"))
@@ -297,6 +277,7 @@ def execution_row(playbook_name, run):
     return {
         "Event ID": run.get("container"),
         "Playbook": playbook_name,
+        "Playbook Version": playbook_version,
         "Run ID": run.get("id"),
         "Status": status,
         "Start Time (UTC)": fmt_time(started),
@@ -330,20 +311,58 @@ def summary_row(name, executions, note=""):
 
 
 def build_report(client, playbook_names, start, end):
-    """Return (execution rows, summary rows) for the given playbooks and time range."""
+    """Return (execution rows, summary rows) for the given playbooks and time range.
+
+    SOAR keeps every saved version of a playbook as a separate playbook record
+    with its own id, and each run points at the id of the version that ran. So
+    runs are matched by the playbook's repo and name, not by the current id.
+    """
+    scm_names = {s["id"]: s["name"] for s in client.get_all("scm")}
+    wanted = {}  # configured name -> (repo or "", playbook name)
+    for full_name in playbook_names:
+        repo, _, name = full_name.strip().rpartition("/")
+        wanted[full_name] = (repo, name)
+
+    playbooks = {}            # playbook id -> playbook record, None if SOAR no longer has it
+    rows_by_name = {full_name: [] for full_name in playbook_names}
+    ids_by_name = {full_name: set() for full_name in playbook_names}
+    runs_per_id = Counter()
+
+    log.info("Downloading playbook runs in the window")
+    for run in client.get_all("playbook_run", time_filter(start, end)):
+        pb_id = run.get("playbook")
+        runs_per_id[pb_id] += 1
+        if pb_id not in playbooks:
+            playbooks[pb_id] = client.playbook(pb_id)
+        pb = playbooks[pb_id]
+        if not pb:
+            continue
+        repo = scm_names.get(pb.get("scm"), "")
+        for full_name, (want_repo, want_name) in wanted.items():
+            if pb.get("name") == want_name and (not want_repo or want_repo == repo):
+                rows_by_name[full_name].append(execution_row(full_name, pb.get("version", ""), run))
+                ids_by_name[full_name].add(pb_id)
+
+    if DEBUG:
+        log.debug("Runs in the window for ALL playbooks: %s", sum(runs_per_id.values()))
+        for pb_id, runs in runs_per_id.most_common():
+            pb = playbooks.get(pb_id)
+            label = f"{scm_names.get(pb.get('scm'), '?')}/{pb.get('name')} (version {pb.get('version')})" if pb else \
+                "(playbook record not found - deleted or no access)"
+            counted = [n for n, ids in ids_by_name.items() if pb_id in ids]
+            log.debug("  playbook id %-6s %-60s %5s runs  %s", pb_id, label, runs,
+                      f"-> counted as {', '.join(counted)}" if counted else "(not in PLAYBOOKS)")
+
     executions, summary = [], []
     for full_name in playbook_names:
-        log.info("Collecting runs for %s", full_name)
-        playbooks = client.find_playbooks(full_name)
-        if not playbooks:
-            log.warning("Playbook not found in SOAR: %s", full_name)
-            summary.append(summary_row(full_name, [], note="Playbook not found"))
-            continue
-
+        rows = rows_by_name[full_name]
+        ids = sorted(ids_by_name[full_name])
         note = ""
-        if len(playbooks) > 1:
-            note = f"Combined {len(playbooks)} playbooks with this name (ids {', '.join(str(p['id']) for p in playbooks)})"
-        rows = [execution_row(full_name, run) for pb in playbooks for run in client.playbook_runs(pb["id"], start, end)]
+        if len(ids) > 1:
+            note = f"Counted across {len(ids)} playbook IDs/versions: {', '.join(map(str, ids))}"
+        elif not rows and not client.find_playbooks(full_name):
+            log.warning("Playbook not found in SOAR: %s", full_name)
+            note = "Playbook not found"
         executions.extend(rows)
         summary.append(summary_row(full_name, rows, note))
 
@@ -600,8 +619,6 @@ def main():
             timeout=SOAR_TIMEOUT,
             page_size=SOAR_PAGE_SIZE,
         )
-        if DEBUG:
-            log_diagnostics(client, PLAYBOOKS, start, end)
         executions, summary = build_report(client, PLAYBOOKS, start, end)
 
         report_path = os.path.join(OUTPUT_DIR, f"soar_playbook_report_{start:%Y%m%d_%H%M}_to_{end:%Y%m%d_%H%M}.xlsx")
