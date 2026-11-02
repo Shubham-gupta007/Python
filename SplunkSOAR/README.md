@@ -51,9 +51,10 @@ Excel library.
 | `SOAR_AUTH_TOKEN` | The automation user's token, or `""` to read the `SOAR_AUTH_TOKEN` env var |
 | `SOAR_VERIFY_SSL` | `True`, `False` (self-signed certificate; not recommended), or the path to a CA bundle file |
 | `PLAYBOOKS` | Playbooks to report on. `repo/name` (for example `local/my_playbook`) picks one repo. A bare `name` matches every repo and combines their runs into one row |
-| `START_TIME`, `END_TIME` | Time range, see below |
+| `START_TIME`, `END_TIME` | Time range of the report, see below |
 | `LOOKBACK_DAYS` | Used only when `START_TIME` is empty: the range starts this many days before `END_TIME` |
 | `OUTPUT_DIR` | Folder the `.xlsx` report is written to |
+| `SEND_EMAIL` | `True` to email the report, `False` to only write the file |
 | `SMTP_HOST`, `SMTP_PORT` | Your mail server |
 | `SMTP_USE_TLS` / `SMTP_USE_SSL` | Port 587: `SMTP_USE_TLS = True` (STARTTLS). Port 465: `SMTP_USE_SSL = True` |
 | `SMTP_USERNAME`, `SMTP_PASSWORD` | SMTP login. Leave `SMTP_USERNAME = ""` if your relay does not need one. Leave `SMTP_PASSWORD = ""` to read the `SMTP_PASSWORD` env var |
@@ -62,7 +63,14 @@ Excel library.
 ### Time range
 
 The report includes runs whose **start time** is between `START_TIME` and
-`END_TIME`, both inclusive.
+`END_TIME`, both inclusive. For example, for October 2026:
+
+```python
+START_TIME = "2026-10-01 00:00:00"
+END_TIME = "2026-10-31 23:59:59"
+```
+
+Accepted values:
 
 | Value | Meaning |
 |---|---|
@@ -84,23 +92,20 @@ export SMTP_PASSWORD='...'
 ## Run
 
 ```bash
-python soar_playbook_report.py                                          # settings from the top of the script
-python soar_playbook_report.py --start 2026-10-01 --end 2026-10-31      # whole of October (UTC)
-python soar_playbook_report.py --start "2026-10-01 00:00:00" --end "2026-10-31 23:59:59"
-python soar_playbook_report.py --start "2026-10-01 00:00:00+05:30" --end "2026-10-31 23:59:59+05:30"
-python soar_playbook_report.py --days 30                                # last 30 days
-python soar_playbook_report.py --no-email                               # workbook only
-python soar_playbook_report.py --playbooks local/pb_a community/pb_b    # override PLAYBOOKS
-python soar_playbook_report.py --output october.xlsx                    # choose the file name
+python soar_playbook_report.py
 ```
 
-The command-line options override the matching settings at the top of the script.
-The default file name is `soar_playbook_report_<start>_to_<end>.xlsx` in `OUTPUT_DIR`.
+All settings come from the CONFIGURATION section, so the script takes no
+command-line options. The report is saved as
+`OUTPUT_DIR/soar_playbook_report_<start>_to_<end>.xlsx`.
 
 The script exits with code 1 on any error (bad token, SOAR unreachable, SMTP
 failure, and so on), so a scheduler can catch the failure.
 
 ## Schedule it (weekly, Monday 08:00)
+
+For a recurring report, leave `START_TIME` and `END_TIME` empty so each run
+covers the last `LOOKBACK_DAYS` days.
 
 ```cron
 0 8 * * 1 cd /opt/soar-report && /usr/bin/python3 soar_playbook_report.py >> report.log 2>&1

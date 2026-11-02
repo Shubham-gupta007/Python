@@ -8,15 +8,11 @@ playbooks and a time range, then builds an Excel workbook with two sheets:
   2. Success Summary  - runs, successes, failures and success rate per playbook
 and emails the workbook over SMTP.
 
-Uses only the Python standard library. Edit the CONFIGURATION section below,
-then run:
+Uses only the Python standard library (no pip installs). Edit the
+CONFIGURATION section below, then run:
     python soar_playbook_report.py
-    python soar_playbook_report.py --start "2026-10-01 00:00:00" --end "2026-10-31 23:59:59"
-    python soar_playbook_report.py --start 2026-10-01 --end 2026-10-31 --no-email
-    python soar_playbook_report.py --playbooks local/pb_one community/pb_two
 """
 
-import argparse
 import json
 import logging
 import os
@@ -63,11 +59,13 @@ PLAYBOOKS = [
 # "2026-10-01 00:00:00+05:30".
 # Leave START_TIME empty to use END_TIME minus LOOKBACK_DAYS.
 # Leave END_TIME empty to use the current time.
-START_TIME = ""
-END_TIME = ""
+START_TIME = "2026-10-01 00:00:00"
+END_TIME = "2026-10-31 23:59:59"
 LOOKBACK_DAYS = 7
 
+# ---- Output -----------------------------------------------------------------
 OUTPUT_DIR = "reports"   # folder the .xlsx report is written to
+SEND_EMAIL = True        # False = only write the report file, don't email it
 
 # ---- SMTP -------------------------------------------------------------------
 SMTP_HOST = "smtp.example.com"
@@ -520,15 +518,15 @@ def send_email(msg):
 
 # ---- Main -------------------------------------------------------------------
 
-def check_config(playbook_names, send_mail):
+def check_config():
     problems = []
     if not SOAR_BASE_URL:
         problems.append("SOAR_BASE_URL is empty")
     if not soar_auth_token():
         problems.append("SOAR auth token missing: set SOAR_AUTH_TOKEN at the top of the script or as an env var")
-    if not playbook_names:
-        problems.append("no playbooks given: fill in PLAYBOOKS or pass --playbooks")
-    if send_mail:
+    if not PLAYBOOKS:
+        problems.append("PLAYBOOKS is empty")
+    if SEND_EMAIL:
         if not SMTP_HOST:
             problems.append("SMTP_HOST is empty")
         if not EMAIL_FROM:
@@ -539,32 +537,12 @@ def check_config(playbook_names, send_mail):
         raise ValueError("Configuration problem: " + "; ".join(problems))
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Splunk SOAR playbook execution / success-rate report")
-    parser.add_argument("--start", help='range start, "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD" (overrides START_TIME)')
-    parser.add_argument("--end", help='range end, "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD" (overrides END_TIME)')
-    parser.add_argument("--days", type=int, help="look-back days when no start is given (overrides LOOKBACK_DAYS)")
-    parser.add_argument("--playbooks", nargs="+", help="playbook names to report on (overrides PLAYBOOKS)")
-    parser.add_argument("--output", help="report path (default: OUTPUT_DIR/soar_playbook_report_<start>_to_<end>.xlsx)")
-    parser.add_argument("--no-email", action="store_true", help="only write the report, don't send it")
-    parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
-    return parser.parse_args(argv)
-
-
-def main(argv=None):
-    args = parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     try:
-        playbook_names = args.playbooks or PLAYBOOKS
-        check_config(playbook_names, send_mail=not args.no_email)
-
-        start, end = resolve_time_range(
-            args.start or START_TIME, args.end or END_TIME, args.days or LOOKBACK_DAYS
-        )
+        check_config()
+        start, end = resolve_time_range(START_TIME, END_TIME, LOOKBACK_DAYS)
         period = f"{start:{TIME_FORMAT}} to {end:{TIME_FORMAT}} UTC"
         log.info("Reporting on runs started from %s", period)
 
@@ -575,18 +553,16 @@ def main(argv=None):
             timeout=SOAR_TIMEOUT,
             page_size=SOAR_PAGE_SIZE,
         )
-        executions, summary = build_report(client, playbook_names, start, end)
+        executions, summary = build_report(client, PLAYBOOKS, start, end)
 
-        report_path = args.output or os.path.join(
-            OUTPUT_DIR, f"soar_playbook_report_{start:%Y%m%d_%H%M}_to_{end:%Y%m%d_%H%M}.xlsx"
-        )
+        report_path = os.path.join(OUTPUT_DIR, f"soar_playbook_report_{start:%Y%m%d_%H%M}_to_{end:%Y%m%d_%H%M}.xlsx")
         write_xlsx(report_path, [
             (EXECUTION_SHEET, EXECUTION_COLUMNS, executions, False),
             (SUMMARY_SHEET, SUMMARY_COLUMNS, summary, True),
         ])
         log.info("Report written to %s (%s)", report_path, overall_summary(summary))
 
-        if args.no_email:
+        if not SEND_EMAIL:
             return 0
         send_email(build_email(summary, report_path, period))
         log.info("Report emailed to %s", ", ".join(EMAIL_TO + EMAIL_CC))
