@@ -3,32 +3,36 @@
 Splunk SOAR playbook execution report.
 
 Pulls playbook run history from the Splunk SOAR REST API for a list of
-playbooks, writes a CSV with the number of executions and the success rate
-of each one, and emails the CSV over SMTP.
+playbooks and a time range, then builds an Excel workbook with two sheets:
+  1. Event Executions - every playbook run, with the event (container) ID it ran on
+  2. Success Summary  - runs, successes, failures and success rate per playbook
+and emails the workbook over SMTP.
 
 Uses only the Python standard library. Edit the CONFIGURATION section below,
 then run:
     python soar_playbook_report.py
-    python soar_playbook_report.py --days 30 --no-email
+    python soar_playbook_report.py --start "2026-10-01 00:00:00" --end "2026-10-31 23:59:59"
+    python soar_playbook_report.py --start 2026-10-01 --end 2026-10-31 --no-email
     python soar_playbook_report.py --playbooks local/pb_one community/pb_two
 """
 
 import argparse
-import csv
 import json
 import logging
 import os
+import re
 import smtplib
 import ssl
 import sys
+import zipfile
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from email.message import EmailMessage
 from html import escape
-from itertools import chain
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from xml.sax.saxutils import escape as xml_escape
 
 # =============================================================================
 # CONFIGURATION
@@ -51,8 +55,19 @@ PLAYBOOKS = [
     "community/ip_reputation_lookup",
     "malware_triage",
 ]
-LOOKBACK_DAYS = 7        # report window in days
-OUTPUT_DIR = "reports"   # folder the CSV is written to
+
+# ---- Report time range ------------------------------------------------------
+# Runs whose start time falls between START_TIME and END_TIME (both inclusive).
+# Format: "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD" (a date-only END_TIME covers
+# that whole day). Times are UTC unless you add an offset, e.g.
+# "2026-10-01 00:00:00+05:30".
+# Leave START_TIME empty to use END_TIME minus LOOKBACK_DAYS.
+# Leave END_TIME empty to use the current time.
+START_TIME = ""
+END_TIME = ""
+LOOKBACK_DAYS = 7
+
+OUTPUT_DIR = "reports"   # folder the .xlsx report is written to
 
 # ---- SMTP -------------------------------------------------------------------
 SMTP_HOST = "smtp.example.com"
@@ -73,8 +88,21 @@ EMAIL_SUBJECT = "Splunk SOAR Playbook Execution Report"
 
 log = logging.getLogger("soar_playbook_report")
 
-CSV_COLUMNS = [
+EXECUTION_SHEET = "Event Executions"
+EXECUTION_COLUMNS = [
+    "Event ID",
     "Playbook",
+    "Run ID",
+    "Status",
+    "Start Time (UTC)",
+    "End Time (UTC)",
+    "Duration (s)",
+]
+
+SUMMARY_SHEET = "Success Summary"
+SUMMARY_COLUMNS = [
+    "Playbook",
+    "Events",
     "Total Runs",
     "Succeeded",
     "Failed",
@@ -84,8 +112,11 @@ CSV_COLUMNS = [
     "Last Run (UTC)",
     "Notes",
 ]
+TOTAL_ROW_NAME = "ALL PLAYBOOKS"
 
 COMPLETED_STATUSES = ("success", "failed")
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+XLSX_MIME = ("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 def soar_auth_token():
@@ -159,14 +190,18 @@ class SoarClient:
             params["_filter_scm"] = scms[0]["id"]
         return list(self.get_all("playbook", params))
 
-    def playbook_runs(self, playbook_id, since):
-        """Yield the runs of one playbook that started at or after `since` (UTC)."""
+    def playbook_runs(self, playbook_id, start, end):
+        """Yield the runs of one playbook that started between `start` and `end` (UTC, inclusive)."""
         params = {
             "_filter_playbook": playbook_id,
-            "_filter_start_time__gte": json.dumps(since.strftime("%Y-%m-%dT%H:%M:%S")),
+            "_filter_start_time__gte": json.dumps(start.strftime("%Y-%m-%dT%H:%M:%S")),
+            # .999999 so an END_TIME like 23:59:59 also includes runs during that last second.
+            "_filter_start_time__lte": json.dumps(end.strftime("%Y-%m-%dT%H:%M:%S") + ".999999"),
         }
         return self.get_all("playbook_run", params)
 
+
+# ---- Time handling ----------------------------------------------------------
 
 def parse_time(value):
     """Parse a SOAR timestamp such as "2026-10-29T07:36:41.728895Z"."""
@@ -178,29 +213,64 @@ def parse_time(value):
         return None
 
 
-def summarize_runs(name, runs, note=""):
-    """Reduce an iterable of playbook_run records to one CSV row."""
-    statuses = Counter()
-    durations = []
-    last_start = None
+def parse_user_time(value, setting, end_of_day=False):
+    """Parse a START_TIME / END_TIME value into an aware UTC datetime."""
+    value = value.strip()
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(
+            f"{setting} {value!r} is not a valid time; use 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD'"
+        )
+    if end_of_day and len(value) == 10:  # date only, e.g. "2026-10-31"
+        dt = datetime.combine(dt.date(), time(23, 59, 59))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
-    for run in runs:
-        status = (run.get("status") or "unknown").lower()
-        statuses[status] += 1
-        start = parse_time(run.get("start_time"))
-        if start and (last_start is None or start > last_start):
-            last_start = start
-        end = parse_time(run.get("update_time"))
-        if status in COMPLETED_STATUSES and start and end:
-            durations.append((end - start).total_seconds())
 
-    total = sum(statuses.values())
+def resolve_time_range(start_value, end_value, lookback_days):
+    end = parse_user_time(end_value, "END_TIME", end_of_day=True) if end_value else datetime.now(timezone.utc)
+    start = parse_user_time(start_value, "START_TIME") if start_value else end - timedelta(days=lookback_days)
+    if start >= end:
+        raise ValueError(f"START_TIME ({start:{TIME_FORMAT}}) must be before END_TIME ({end:{TIME_FORMAT}})")
+    return start, end
+
+
+def fmt_time(dt):
+    return dt.strftime(TIME_FORMAT) if dt else ""
+
+
+# ---- Report building --------------------------------------------------------
+
+def execution_row(playbook_name, run):
+    """One row of the Event Executions sheet."""
+    status = (run.get("status") or "unknown").lower()
+    started = parse_time(run.get("start_time"))
+    # update_time is when the run last changed, i.e. when it finished for completed runs.
+    ended = parse_time(run.get("update_time")) if status in COMPLETED_STATUSES else None
+    return {
+        "Event ID": run.get("container"),
+        "Playbook": playbook_name,
+        "Run ID": run.get("id"),
+        "Status": status,
+        "Start Time (UTC)": fmt_time(started),
+        "End Time (UTC)": fmt_time(ended),
+        "Duration (s)": round((ended - started).total_seconds(), 1) if started and ended else "",
+    }
+
+
+def summary_row(name, executions, note=""):
+    """One row of the Success Summary sheet, built from that playbook's execution rows."""
+    statuses = Counter(e["Status"] for e in executions)
+    durations = [e["Duration (s)"] for e in executions if e["Duration (s)"] != ""]
+    total = len(executions)
     succeeded = statuses["success"]
     failed = statuses["failed"]
     completed = succeeded + failed
-
     return {
         "Playbook": name,
+        "Events": len({e["Event ID"] for e in executions if e["Event ID"] is not None}),
         "Total Runs": total,
         "Succeeded": succeeded,
         "Failed": failed,
@@ -208,77 +278,214 @@ def summarize_runs(name, runs, note=""):
         # Success rate is over completed runs, so runs still in progress don't drag it down.
         "Success Rate (%)": round(succeeded / completed * 100, 2) if completed else "N/A",
         "Avg Duration (s)": round(sum(durations) / len(durations), 1) if durations else "N/A",
-        "Last Run (UTC)": last_start.strftime("%Y-%m-%d %H:%M:%S") if last_start else "",
+        # TIME_FORMAT strings sort chronologically, so max() is the latest run.
+        "Last Run (UTC)": max((e["Start Time (UTC)"] for e in executions), default=""),
         "Notes": note,
     }
 
 
-def build_report_rows(client, playbook_names, since):
-    rows = []
+def build_report(client, playbook_names, start, end):
+    """Return (execution rows, summary rows) for the given playbooks and time range."""
+    executions, summary = [], []
     for full_name in playbook_names:
         log.info("Collecting runs for %s", full_name)
         playbooks = client.find_playbooks(full_name)
         if not playbooks:
             log.warning("Playbook not found in SOAR: %s", full_name)
-            rows.append(summarize_runs(full_name, [], note="Playbook not found"))
+            summary.append(summary_row(full_name, [], note="Playbook not found"))
             continue
 
         note = ""
         if len(playbooks) > 1:
             note = f"Combined {len(playbooks)} playbooks with this name (ids {', '.join(str(p['id']) for p in playbooks)})"
-        runs = chain.from_iterable(client.playbook_runs(pb["id"], since) for pb in playbooks)
-        rows.append(summarize_runs(full_name, runs, note))
-    return rows
+        rows = [execution_row(full_name, run) for pb in playbooks for run in client.playbook_runs(pb["id"], start, end)]
+        executions.extend(rows)
+        summary.append(summary_row(full_name, rows, note))
+
+    executions.sort(key=lambda e: (e["Event ID"] is None, e["Event ID"] or 0, e["Start Time (UTC)"]))
+    summary.append(summary_row(TOTAL_ROW_NAME, executions))
+    return executions, summary
 
 
-def write_csv(rows, path):
+# ---- Excel (.xlsx) writer, standard library only ----------------------------
+
+_ILLEGAL_XML_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _column_letter(index):
+    """0 -> A, 25 -> Z, 26 -> AA."""
+    letters = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _cell_xml(ref, value, style=0):
+    style_attr = f' s="{style}"' if style else ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f'<c r="{ref}"{style_attr}><v>{value}</v></c>'
+    text = xml_escape(_ILLEGAL_XML_CHARS.sub("", "" if value is None else str(value)))
+    return f'<c r="{ref}"{style_attr} t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
+
+
+def _sheet_xml(columns, rows, bold_last_row=False):
+    widths = [len(c) for c in columns]
+    for row in rows:
+        for i, c in enumerate(columns):
+            widths[i] = max(widths[i], len(str(row.get(c, ""))))
+    cols_xml = "".join(
+        f'<col min="{i + 1}" max="{i + 1}" width="{min(w + 3, 70)}" customWidth="1"/>' for i, w in enumerate(widths)
+    )
+
+    lines = ["<row r=\"1\">" + "".join(_cell_xml(f"{_column_letter(i)}1", c, style=1) for i, c in enumerate(columns)) + "</row>"]
+    for r, row in enumerate(rows, start=2):
+        style = 2 if bold_last_row and r == len(rows) + 1 else 0
+        cells = "".join(_cell_xml(f"{_column_letter(i)}{r}", row.get(c), style) for i, c in enumerate(columns))
+        lines.append(f'<row r="{r}">{cells}</row>')
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetViews><sheetView workbookViewId="0">'
+        '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+        "</sheetView></sheetViews>"
+        f"<cols>{cols_xml}</cols>"
+        f"<sheetData>{''.join(lines)}</sheetData>"
+        "</worksheet>"
+    )
+
+
+_STYLES_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>'
+    '<font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+    '<fills count="3"><fill><patternFill patternType="none"/></fill>'
+    '<fill><patternFill patternType="gray125"/></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFD9E1F2"/><bgColor indexed="64"/></patternFill></fill></fills>'
+    '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+    '<cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+    '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
+    '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
+    '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+    "</styleSheet>"
+)
+
+
+def write_xlsx(path, sheets):
+    """Write an .xlsx workbook. `sheets` is a list of (sheet name, columns, rows, bold_last_row)."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
+    count = len(sheets)
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/styles.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        + "".join(
+            f'<Override PartName="/xl/worksheets/sheet{i}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for i in range(1, count + 1)
+        )
+        + "</Types>"
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/></Relationships>'
+    )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
+        + "".join(
+            f'<sheet name="{xml_escape(name[:31])}" sheetId="{i}" r:id="rId{i}"/>'
+            for i, (name, *_) in enumerate(sheets, start=1)
+        )
+        + "</sheets></workbook>"
+    )
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(
+            f'<Relationship Id="rId{i}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            f'Target="worksheets/sheet{i}.xml"/>'
+            for i in range(1, count + 1)
+        )
+        + f'<Relationship Id="rId{count + 1}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
+        'Target="styles.xml"/></Relationships>'
+    )
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", root_rels)
+        zf.writestr("xl/workbook.xml", workbook)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        zf.writestr("xl/styles.xml", _STYLES_XML)
+        for i, (_, columns, rows, bold_last_row) in enumerate(sheets, start=1):
+            zf.writestr(f"xl/worksheets/sheet{i}.xml", _sheet_xml(columns, rows, bold_last_row))
 
 
-def overall_summary(rows):
-    total = sum(r["Total Runs"] for r in rows)
-    succeeded = sum(r["Succeeded"] for r in rows)
-    completed = succeeded + sum(r["Failed"] for r in rows)
-    rate = f"{succeeded / completed * 100:.2f}%" if completed else "N/A"
-    return f"{total} runs across {len(rows)} playbooks, overall success rate {rate}"
+# ---- Email ------------------------------------------------------------------
+
+def overall_summary(summary):
+    total = summary[-1]  # the ALL PLAYBOOKS row
+    rate = total["Success Rate (%)"]
+    return (
+        f"{total['Total Runs']} runs on {total['Events']} events across {len(summary) - 1} playbooks, "
+        f"overall success rate {rate if rate == 'N/A' else f'{rate}%'}"
+    )
 
 
-def build_email(rows, csv_path, period):
-    summary = overall_summary(rows)
+def build_email(summary, report_path, period):
+    headline = overall_summary(summary)
 
-    text_lines = [f"Splunk SOAR playbook execution report for {period}", summary, ""]
-    for r in rows:
+    text_lines = [f"Splunk SOAR playbook execution report for {period}", headline, ""]
+    for r in summary[:-1]:
         rate = r["Success Rate (%)"]
         text_lines.append(
-            f"- {r['Playbook']}: {r['Total Runs']} runs, {r['Succeeded']} succeeded, "
+            f"- {r['Playbook']}: {r['Total Runs']} runs on {r['Events']} events, {r['Succeeded']} succeeded, "
             f"{r['Failed']} failed, success rate {rate if rate == 'N/A' else f'{rate}%'}"
         )
-    text_lines += ["", "Success rate = succeeded / (succeeded + failed). Full report attached as CSV."]
+    text_lines += [
+        "",
+        "Success rate = succeeded / (succeeded + failed).",
+        f"Attached workbook: sheet '{EXECUTION_SHEET}' lists every run by event ID, "
+        f"sheet '{SUMMARY_SHEET}' has the success rate per playbook.",
+    ]
 
     header_html = "".join(
-        f'<th style="border:1px solid #ccc;padding:6px;background:#f2f2f2;text-align:left">{escape(c)}</th>'
-        for c in CSV_COLUMNS
+        f'<th style="border:1px solid #ccc;padding:6px;background:#d9e1f2;text-align:left">{escape(c)}</th>'
+        for c in SUMMARY_COLUMNS
     )
+    bold = ' style="font-weight:bold"'
     rows_html = "".join(
-        "<tr>"
-        + "".join(f'<td style="border:1px solid #ccc;padding:6px">{escape(str(r[c]))}</td>' for c in CSV_COLUMNS)
+        f"<tr{bold if r['Playbook'] == TOTAL_ROW_NAME else ''}>"
+        + "".join(f'<td style="border:1px solid #ccc;padding:6px">{escape(str(r[c]))}</td>' for c in SUMMARY_COLUMNS)
         + "</tr>"
-        for r in rows
+        for r in summary
     )
     html = f"""\
 <html><body style="font-family:Arial,sans-serif;font-size:14px">
 <p>Splunk SOAR playbook execution report for <b>{escape(period)}</b></p>
-<p>{escape(summary)}</p>
+<p>{escape(headline)}</p>
 <table style="border-collapse:collapse">
 <tr>{header_html}</tr>
 {rows_html}
 </table>
-<p style="color:#666">Success rate = succeeded / (succeeded + failed); runs still in progress are excluded.
-The full report is attached as CSV.</p>
+<p style="color:#666">Success rate = succeeded / (succeeded + failed); runs still in progress are excluded.<br>
+Attached workbook: sheet <b>{escape(EXECUTION_SHEET)}</b> lists every run by event ID,
+sheet <b>{escape(SUMMARY_SHEET)}</b> has the success rate per playbook.</p>
 </body></html>
 """
 
@@ -290,8 +497,8 @@ The full report is attached as CSV.</p>
         msg["Cc"] = ", ".join(EMAIL_CC)
     msg.set_content("\n".join(text_lines))
     msg.add_alternative(html, subtype="html")
-    with open(csv_path, "rb") as f:
-        msg.add_attachment(f.read(), maintype="text", subtype="csv", filename=os.path.basename(csv_path))
+    with open(report_path, "rb") as f:
+        msg.add_attachment(f.read(), maintype=XLSX_MIME[0], subtype=XLSX_MIME[1], filename=os.path.basename(report_path))
     return msg
 
 
@@ -310,6 +517,8 @@ def send_email(msg):
         # send_message delivers to every address in the To and Cc headers.
         server.send_message(msg)
 
+
+# ---- Main -------------------------------------------------------------------
 
 def check_config(playbook_names, send_mail):
     problems = []
@@ -332,10 +541,12 @@ def check_config(playbook_names, send_mail):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Splunk SOAR playbook execution / success-rate report")
-    parser.add_argument("--days", type=int, help="look-back window in days (overrides LOOKBACK_DAYS)")
+    parser.add_argument("--start", help='range start, "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD" (overrides START_TIME)')
+    parser.add_argument("--end", help='range end, "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD" (overrides END_TIME)')
+    parser.add_argument("--days", type=int, help="look-back days when no start is given (overrides LOOKBACK_DAYS)")
     parser.add_argument("--playbooks", nargs="+", help="playbook names to report on (overrides PLAYBOOKS)")
-    parser.add_argument("--output", help="CSV output path (default: OUTPUT_DIR/soar_playbook_report_<timestamp>.csv)")
-    parser.add_argument("--no-email", action="store_true", help="only write the CSV, don't send it")
+    parser.add_argument("--output", help="report path (default: OUTPUT_DIR/soar_playbook_report_<start>_to_<end>.xlsx)")
+    parser.add_argument("--no-email", action="store_true", help="only write the report, don't send it")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return parser.parse_args(argv)
 
@@ -351,10 +562,11 @@ def main(argv=None):
         playbook_names = args.playbooks or PLAYBOOKS
         check_config(playbook_names, send_mail=not args.no_email)
 
-        days = args.days or LOOKBACK_DAYS
-        now = datetime.now(timezone.utc)
-        since = now - timedelta(days=days)
-        period = f"{since:%Y-%m-%d %H:%M} to {now:%Y-%m-%d %H:%M} UTC"
+        start, end = resolve_time_range(
+            args.start or START_TIME, args.end or END_TIME, args.days or LOOKBACK_DAYS
+        )
+        period = f"{start:{TIME_FORMAT}} to {end:{TIME_FORMAT}} UTC"
+        log.info("Reporting on runs started from %s", period)
 
         client = SoarClient(
             SOAR_BASE_URL,
@@ -363,15 +575,20 @@ def main(argv=None):
             timeout=SOAR_TIMEOUT,
             page_size=SOAR_PAGE_SIZE,
         )
-        rows = build_report_rows(client, playbook_names, since)
+        executions, summary = build_report(client, playbook_names, start, end)
 
-        csv_path = args.output or os.path.join(OUTPUT_DIR, f"soar_playbook_report_{now:%Y%m%d_%H%M%S}.csv")
-        write_csv(rows, csv_path)
-        log.info("Report written to %s (%s)", csv_path, overall_summary(rows))
+        report_path = args.output or os.path.join(
+            OUTPUT_DIR, f"soar_playbook_report_{start:%Y%m%d_%H%M}_to_{end:%Y%m%d_%H%M}.xlsx"
+        )
+        write_xlsx(report_path, [
+            (EXECUTION_SHEET, EXECUTION_COLUMNS, executions, False),
+            (SUMMARY_SHEET, SUMMARY_COLUMNS, summary, True),
+        ])
+        log.info("Report written to %s (%s)", report_path, overall_summary(summary))
 
         if args.no_email:
             return 0
-        send_email(build_email(rows, csv_path, period))
+        send_email(build_email(summary, report_path, period))
         log.info("Report emailed to %s", ", ".join(EMAIL_TO + EMAIL_CC))
         return 0
 
