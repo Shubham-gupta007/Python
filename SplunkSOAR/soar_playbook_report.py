@@ -66,6 +66,10 @@ LOOKBACK_DAYS = 7
 # ---- Output -----------------------------------------------------------------
 OUTPUT_DIR = "reports"   # folder the .xlsx report is written to
 SEND_EMAIL = True        # False = only write the report file, don't email it
+# True = also log which playbook IDs SOAR has runs for in the time window, the
+# exact REST requests, and how many runs each playbook has in total. Use it when
+# the counts in the report differ from what you see in SOAR.
+DEBUG = False
 
 # ---- SMTP -------------------------------------------------------------------
 SMTP_HOST = "smtp.example.com"
@@ -146,6 +150,7 @@ class SoarClient:
         url = f"{self.base_url}/rest/{endpoint.lstrip('/')}"
         if params:
             url += "?" + urlencode(params)
+        log.debug("GET %s", url)
         req = Request(url, headers={"ph-auth-token": self.auth_token, "Accept": "application/json"})
         try:
             with urlopen(req, timeout=self.timeout, context=self.ssl_context) as resp:
@@ -166,14 +171,23 @@ class SoarClient:
         """Yield every record of a list endpoint, following SOAR's 0-based paging."""
         params = dict(params or {})
         params["page_size"] = self.page_size
-        page = 0
+        page = fetched = 0
         while True:
             params["page"] = page
             body = self.get(endpoint, params)
-            yield from body.get("data", [])
+            data = body.get("data", [])
+            fetched += len(data)
+            yield from data
             page += 1
-            if page >= body.get("num_pages", 0):
+            num_pages = body.get("num_pages")
+            if not data or (page >= num_pages if num_pages is not None else len(data) < self.page_size):
                 break
+        if body.get("count") is not None and fetched != body["count"]:
+            log.warning("SOAR reported %s %s records but %s were downloaded", body["count"], endpoint, fetched)
+
+    def count(self, endpoint, params=None):
+        """Number of records SOAR has for a list query, without downloading them."""
+        return self.get(endpoint, {**(params or {}), "page_size": 1, "page": 0}).get("count")
 
     def find_playbooks(self, full_name):
         """Return playbook records matching "name" or "repo/name" (e.g. "local/my_playbook")."""
@@ -190,13 +204,46 @@ class SoarClient:
 
     def playbook_runs(self, playbook_id, start, end):
         """Yield the runs of one playbook that started between `start` and `end` (UTC, inclusive)."""
-        params = {
-            "_filter_playbook": playbook_id,
-            "_filter_start_time__gte": json.dumps(start.strftime("%Y-%m-%dT%H:%M:%S")),
-            # .999999 so an END_TIME like 23:59:59 also includes runs during that last second.
-            "_filter_start_time__lte": json.dumps(end.strftime("%Y-%m-%dT%H:%M:%S") + ".999999"),
-        }
-        return self.get_all("playbook_run", params)
+        return self.get_all("playbook_run", {"_filter_playbook": playbook_id, **time_filter(start, end)})
+
+
+def time_filter(start, end):
+    """SOAR filter for runs whose start_time is between `start` and `end` (UTC, inclusive)."""
+    return {
+        "_filter_start_time__gte": json.dumps(start.strftime("%Y-%m-%dT%H:%M:%S")),
+        # .999999 so an END_TIME like 23:59:59 also includes runs during that last second.
+        "_filter_start_time__lte": json.dumps(end.strftime("%Y-%m-%dT%H:%M:%S") + ".999999"),
+    }
+
+
+def log_diagnostics(client, playbook_names, start, end):
+    """DEBUG = True: log what SOAR has, to explain counts that differ from what you expect."""
+    log.debug("Time window sent to SOAR (UTC): %s to %s", fmt_time(start), fmt_time(end))
+    scm_names = {s["id"]: s["name"] for s in client.get_all("scm")}
+
+    for full_name in playbook_names:
+        playbooks = client.find_playbooks(full_name)
+        if not playbooks:
+            log.debug("%r: no playbook with this exact name (names are case-sensitive)", full_name)
+        for pb in playbooks:
+            log.debug(
+                "%r -> playbook id %s (%s/%s, version %s, active %s): %s runs in the window, %s runs all time",
+                full_name, pb["id"], scm_names.get(pb.get("scm"), "?"), pb.get("name"), pb.get("version"),
+                pb.get("active"), client.count("playbook_run", {"_filter_playbook": pb["id"], **time_filter(start, end)}),
+                client.count("playbook_run", {"_filter_playbook": pb["id"]}),
+            )
+
+    # Every run in the window, whichever playbook it belongs to. Runs counted here
+    # under a playbook id you didn't expect explain a lower count in the report.
+    per_playbook = Counter(run.get("playbook") for run in client.get_all("playbook_run", time_filter(start, end)))
+    log.debug("Runs in the window for ALL playbooks: %s", sum(per_playbook.values()))
+    for pb_id, runs in per_playbook.most_common():
+        try:
+            pb = client.get(f"playbook/{pb_id}")
+            name = f"{scm_names.get(pb.get('scm'), '?')}/{pb.get('name')}"
+        except RuntimeError:
+            name = "(playbook record not found - deleted or no access)"
+        log.debug("  playbook id %-6s %-50s %s runs", pb_id, name, runs)
 
 
 # ---- Time handling ----------------------------------------------------------
@@ -538,7 +585,7 @@ def check_config():
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     try:
         check_config()
@@ -553,6 +600,8 @@ def main():
             timeout=SOAR_TIMEOUT,
             page_size=SOAR_PAGE_SIZE,
         )
+        if DEBUG:
+            log_diagnostics(client, PLAYBOOKS, start, end)
         executions, summary = build_report(client, PLAYBOOKS, start, end)
 
         report_path = os.path.join(OUTPUT_DIR, f"soar_playbook_report_{start:%Y%m%d_%H%M}_to_{end:%Y%m%d_%H%M}.xlsx")

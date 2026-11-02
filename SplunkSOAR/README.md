@@ -55,6 +55,7 @@ Excel library.
 | `LOOKBACK_DAYS` | Used only when `START_TIME` is empty: the range starts this many days before `END_TIME` |
 | `OUTPUT_DIR` | Folder the `.xlsx` report is written to |
 | `SEND_EMAIL` | `True` to email the report, `False` to only write the file |
+| `DEBUG` | `True` to log the REST requests and which playbook IDs have runs in the window. See "Counts lower than expected" |
 | `SMTP_HOST`, `SMTP_PORT` | Your mail server |
 | `SMTP_USE_TLS` / `SMTP_USE_SSL` | Port 587: `SMTP_USE_TLS = True` (STARTTLS). Port 465: `SMTP_USE_SSL = True` |
 | `SMTP_USERNAME`, `SMTP_PASSWORD` | SMTP login. Leave `SMTP_USERNAME = ""` if your relay does not need one. Leave `SMTP_PASSWORD = ""` to read the `SMTP_PASSWORD` env var |
@@ -101,6 +102,39 @@ command-line options. The report is saved as
 
 The script exits with code 1 on any error (bad token, SOAR unreachable, SMTP
 failure, and so on), so a scheduler can catch the failure.
+
+## Counts lower than expected
+
+The report counts runs whose `playbook` field is one of the playbook IDs found
+for the names in `PLAYBOOKS`, and whose start time is inside the window. Runs
+that miss either condition are left out without an error. The usual reasons:
+
+1. **The time window isn't the one you meant.** Check the
+   `Reporting on runs started from ... to ... UTC` log line. `END_TIME` may
+   still hold an old value, or your times are local but the script reads them
+   as UTC.
+2. **The runs belong to another playbook ID.** For example, the playbook was
+   deleted and imported again, or copied. Or it's in another repo than the one
+   in `repo/name`, or its name differs in capital letters (names must match
+   exactly).
+3. **The other count includes other things.** For example, child playbooks
+   started by your playbook (they have their own name and ID), or action runs.
+
+To see which applies, set `DEBUG = True` and run the script. Among other
+things, it logs:
+
+```
+'local/phishing' -> playbook id 10 (local/phishing, version 3, active True): 14 runs in the window, 950 runs all time
+Runs in the window for ALL playbooks: 132
+  playbook id 10     local/phishing                                     14 runs
+  playbook id 99     (playbook record not found - deleted or no access) 104 runs
+```
+
+Every playbook ID with runs in the window is listed. Any ID not in your report
+is where the missing runs are. Add its name to `PLAYBOOKS`, or fix the window.
+
+If SOAR ever says it has more records than were downloaded, the script logs
+`SOAR reported N playbook_run records but M were downloaded`.
 
 ## Schedule it (weekly, Monday 08:00)
 
