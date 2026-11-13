@@ -12,13 +12,12 @@ already in this folder:
     ip_list      -> block_fortigate_dc_ip / block_fortigate_dr_ip
     domain_list  -> block_fortigate_dc_domain / block_fortigate_dr_domain
     url_list     -> block_apex (ioc_type="URL")
-    sha1_list    -> block_apex (ioc_type="SHA1")
     sha256_list  -> block_apex (ioc_type="SHA256")
-    other_list   -> everything else (unsupported type, or a value that
-                     fails validation for its stated type) - NOT
-                     blocked by this pipeline, kept as
-                     {"indicator": ..., "type": ...} so nothing is
-                     silently dropped
+    other_list   -> everything else (unsupported type - including
+                     SHA1/MD5/email/etc. - or a value that fails
+                     validation for its stated type) - NOT blocked by
+                     this pipeline, kept as {"indicator": ..., "type":
+                     ...} so nothing is silently dropped
 
 Each value going into a block-ready list is defanged/auto-fixed
 (hxxp://, [.], etc.) and validated first, using the same rules as
@@ -36,16 +35,16 @@ How to use in SOAR:
     2. Input parameters: indicator (string - accepts a list too),
        ioc_type (string - accepts a list too, or a single type applied
        to every indicator)
-    3. Output parameters: ip_list, domain_list, url_list, sha1_list,
-       sha256_list, other_list (all string - JSON arrays), ip_count,
-       domain_count, url_count, sha1_count, sha256_count, other_count,
-       total_count (all numeric), warning (string)
+    3. Output parameters: ip_list, domain_list, url_list, sha256_list,
+       other_list (all string - JSON arrays), ip_count, domain_count,
+       url_count, sha256_count, other_count, total_count (all
+       numeric), warning (string)
     4. Paste everything from "import ast" below into the editor.
     5. Downstream: a Format/code block does json.loads(ip_list) to get
        a real Python list, then wires it straight into
        block_fortigate_dc_ip's/block_fortigate_dr_ip's "value" input
        (which already accepts a whole list in one call - no Loop block
-       needed). Same idea for the other four lists.
+       needed). Same idea for the other three lists.
 """
 
 
@@ -61,11 +60,11 @@ def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
         ip_list (CEF type: string) -- JSON array of cleaned IPs
         domain_list (CEF type: string) -- JSON array of cleaned domains
         url_list (CEF type: string) -- JSON array of cleaned URLs
-        sha1_list (CEF type: string) -- JSON array of cleaned SHA1 hashes
         sha256_list (CEF type: string) -- JSON array of cleaned SHA256 hashes
         other_list (CEF type: string) -- JSON array of {"indicator", "type", "reason"}
             for everything not placed in one of the lists above
-        ip_count / domain_count / url_count / sha1_count / sha256_count /
+            (including SHA1/MD5/etc.)
+        ip_count / domain_count / url_count / sha256_count /
             other_count / total_count (CEF type: numeric)
         warning (CEF type: string) -- non-fatal notes (e.g. an
             indicator/ioc_type length mismatch)
@@ -88,9 +87,6 @@ def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
         "FQDN": "DOMAIN",
         "URL": "URL",
         "URI": "URL",
-        "SHA1": "SHA1",
-        "SHA-1": "SHA1",
-        "SHA 1": "SHA1",
         "SHA256": "SHA256",
         "SHA-256": "SHA256",
         "SHA 256": "SHA256",
@@ -156,29 +152,22 @@ def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
             raise ValueError("URL does not contain a valid hostname.")
         return value
 
-    def validate_sha1(value):
-        if not re.fullmatch(r"[0-9A-F]{40}", value):
-            raise ValueError("SHA-1 must contain exactly 40 hexadecimal characters.")
-        return value
-
     def validate_sha256(value):
         if not re.fullmatch(r"[0-9A-F]{64}", value):
             raise ValueError("SHA-256 must contain exactly 64 hexadecimal characters.")
         return value
 
-    fixers = {"IP": fix_ip, "DOMAIN": fix_domain, "URL": fix_url, "SHA1": fix_hash, "SHA256": fix_hash}
+    fixers = {"IP": fix_ip, "DOMAIN": fix_domain, "URL": fix_url, "SHA256": fix_hash}
     validators = {
         "IP": validate_ip,
         "DOMAIN": validate_domain,
         "URL": validate_url,
-        "SHA1": validate_sha1,
         "SHA256": validate_sha256,
     }
     list_key_for_type = {
         "IP": "ip_list",
         "DOMAIN": "domain_list",
         "URL": "url_list",
-        "SHA1": "sha1_list",
         "SHA256": "sha256_list",
     }
 
@@ -251,13 +240,11 @@ def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
         "ip_list": "[]",
         "domain_list": "[]",
         "url_list": "[]",
-        "sha1_list": "[]",
         "sha256_list": "[]",
         "other_list": "[]",
         "ip_count": 0,
         "domain_count": 0,
         "url_count": 0,
-        "sha1_count": 0,
         "sha256_count": 0,
         "other_count": 0,
         "total_count": 0,
@@ -285,7 +272,7 @@ def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
             return types_raw[index]
         return types_raw[0]
 
-    buckets = {"ip_list": [], "domain_list": [], "url_list": [], "sha1_list": [], "sha256_list": []}
+    buckets = {"ip_list": [], "domain_list": [], "url_list": [], "sha256_list": []}
     other = []
 
     pair_count = min(len(indicators), len(types_raw)) if len(types_raw) != 1 else len(indicators)
@@ -322,7 +309,6 @@ def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
         "ip_list": "ip_count",
         "domain_list": "domain_count",
         "url_list": "url_count",
-        "sha1_list": "sha1_count",
         "sha256_list": "sha256_count",
     }
     for list_key, count_key in count_key_for_list_key.items():
