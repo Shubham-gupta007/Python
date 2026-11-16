@@ -207,14 +207,22 @@ def split_iocs_by_type(indicator=None, **kwargs):
         return None
 
     def expand(raw_list):
-        # Unwrap nested single-item lists, then expand any item that
-        # turns out to itself be a stringified list.
+        # Unwrap nested single-item lists, expand any item that turns
+        # out to itself be a stringified list, then split any
+        # remaining string on whitespace - a raw space/tab/newline
+        # never legitimately appears inside a single IP, domain, URL
+        # or hash, so one field holding several whitespace-separated
+        # indicators (a common copy-paste shape from advisories, e.g.
+        # "1.2.3.4 5.6.7.8 8.8.8.8") is split apart here instead of
+        # being treated as one giant unrecognized value.
         expanded = []
         for raw in raw_list:
             item = _item_scalar(raw)
             parsed = _parse_stringified_list(item)
             if parsed is not None:
                 expanded.extend(parsed)
+            elif isinstance(item, str) and re.search(r"\s", item.strip()):
+                expanded.extend(token for token in item.split() if token)
             elif item not in (None, ""):
                 expanded.append(item)
         return expanded
