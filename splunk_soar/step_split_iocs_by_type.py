@@ -1,28 +1,41 @@
 #!/usr/bin/env python3
 """
 Splunk SOAR Custom Function: Split a mixed IOC batch into per-type,
-block-ready lists
+block-ready lists (auto-detects type from the value itself)
 
-Takes a batch of indicators plus their stated types (e.g. an advisory
-table like Indicator/Type columns: IP Address, Domain, URL, SHA256,
-...) and sorts them into separate output lists, one per blockable
-type, each ready to feed straight into the matching block function
-already in this folder:
+Takes just a batch of raw indicator values - no separate "type" input
+needed - and auto-detects each one's type from its own shape (an
+IPv4-looking value, a URL/scheme marker, a 64-hex-char string, or a
+domain-looking value), then sorts them into separate output lists,
+each ready to feed straight into the matching block function already
+in this folder:
 
     ip_list      -> block_fortigate_dc_ip / block_fortigate_dr_ip
     domain_list  -> block_fortigate_dc_domain / block_fortigate_dr_domain
     url_list     -> block_apex (ioc_type="URL")
     sha256_list  -> block_apex (ioc_type="SHA256")
-    other_list   -> everything else (unsupported type - including
-                     SHA1/MD5/email/etc. - or a value that fails
-                     validation for its stated type) - NOT blocked by
-                     this pipeline, kept as {"indicator": ..., "type":
-                     ...} so nothing is silently dropped
+    other_list   -> anything that isn't recognized as one of the four
+                     above (e.g. a SHA1/MD5 hash, an email address, or
+                     a value that doesn't validate even after
+                     defanging) - NOT blocked by this pipeline, kept
+                     as {"indicator": ..., "reason": ...} so nothing
+                     is silently dropped
 
-Each value going into a block-ready list is defanged/auto-fixed
-(hxxp://, [.], etc.) and validated first, using the same rules as
-normalize_validate_ioc.py (step2) - a value that doesn't validate even
-after fixing goes to other_list instead, with the reason recorded.
+Each value is defanged/auto-fixed first (hxxp://, [.], etc. - same
+rules as normalize_validate_ioc.py / step2), then classified and
+validated against its best-matching type. Checked in this order so
+nothing gets misread:
+
+    1. URL - a defanged scheme marker (hxxp/hxxps) or a literal
+       "://" in the value
+    2. Hash - a string that's pure hex once whitespace/colons/dashes
+       are stripped; 64 hex chars -> SHA256, any other hex length
+       (40 = SHA1, 32 = MD5, ...) -> a real hash, just not one this
+       pipeline blocks, so it goes to other_list
+    3. IP - parses as a valid IPv4 address
+    4. Domain - matches a plain hostname shape
+    5. Anything left over -> other_list
+
 Duplicate values within the same list are dropped (order preserved).
 
 No external libraries - re/ipaddress/urllib.parse/ast/json are all
@@ -32,9 +45,7 @@ How to use in SOAR:
 
     1. Playbook editor -> Custom Function -> New Custom Function,
        name it "split_iocs_by_type".
-    2. Input parameters: indicator (string - accepts a list too),
-       ioc_type (string - accepts a list too, or a single type applied
-       to every indicator)
+    2. Input parameters: indicator (string - accepts a list too)
     3. Output parameters: ip_list, domain_list, url_list, sha256_list,
        other_list (all string - JSON arrays), ip_count, domain_count,
        url_count, sha256_count, other_count, total_count (all
@@ -48,26 +59,22 @@ How to use in SOAR:
 """
 
 
-def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
+def split_iocs_by_type(indicator=None, **kwargs):
     """
     Args:
         indicator (CEF type: string) -- one indicator value, or a list of them
-        ioc_type (CEF type: string) -- one type label per indicator (a
-            list the same length as indicator), or a single type label
-            applied to every indicator
 
     Returns a JSON-serializable object that implements the configured data paths:
         ip_list (CEF type: string) -- JSON array of cleaned IPs
         domain_list (CEF type: string) -- JSON array of cleaned domains
         url_list (CEF type: string) -- JSON array of cleaned URLs
         sha256_list (CEF type: string) -- JSON array of cleaned SHA256 hashes
-        other_list (CEF type: string) -- JSON array of {"indicator", "type", "reason"}
+        other_list (CEF type: string) -- JSON array of {"indicator", "reason"}
             for everything not placed in one of the lists above
-            (including SHA1/MD5/etc.)
+            (SHA1/MD5/email/etc., or anything that fails validation)
         ip_count / domain_count / url_count / sha256_count /
             other_count / total_count (CEF type: numeric)
-        warning (CEF type: string) -- non-fatal notes (e.g. an
-            indicator/ioc_type length mismatch)
+        warning (CEF type: string) -- non-fatal notes
     """
     ########################## Custom Code Goes Below This Line ##########################
     import ast
@@ -75,22 +82,6 @@ def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
     import json
     import re
     from urllib.parse import urlparse
-
-    type_aliases = {
-        "IP": "IP",
-        "IP ADDRESS": "IP",
-        "IPADDRESS": "IP",
-        "IPV4": "IP",
-        "IP_ADDRESS": "IP",
-        "DOMAIN": "DOMAIN",
-        "DOMAIN NAME": "DOMAIN",
-        "FQDN": "DOMAIN",
-        "URL": "URL",
-        "URI": "URL",
-        "SHA256": "SHA256",
-        "SHA-256": "SHA256",
-        "SHA 256": "SHA256",
-    }
 
     def strip_wrapping(value):
         return value.strip().strip("\"'<>").strip()
@@ -106,22 +97,20 @@ def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
         value = value.replace("[at]", "@").replace("(at)", "@")
         return value.strip()
 
-    def fix_ip(raw):
-        return defang_fix(raw)
-
-    def fix_domain(raw):
-        return defang_fix(raw).rstrip(".").lower()
-
     def fix_url(raw):
         value = defang_fix(raw)
         if not re.match(r"^https?://", value, flags=re.IGNORECASE):
             value = "http://" + value
         return value
 
-    def fix_hash(raw):
-        value = defang_fix(raw)
-        value = re.sub(r"[\s:-]", "", value)
-        return value.upper()
+    def validate_url(value):
+        if not (value.startswith("http://") or value.startswith("https://")):
+            raise ValueError("URL must start with http:// or https://")
+        if len(value) > 2047:
+            raise ValueError("URL exceeds 2047 characters.")
+        if not urlparse(value).netloc:
+            raise ValueError("URL does not contain a valid hostname.")
+        return value
 
     def validate_ip(value):
         try:
@@ -143,33 +132,44 @@ def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
             raise ValueError(f"Invalid domain: {value}")
         return value
 
-    def validate_url(value):
-        if not (value.startswith("http://") or value.startswith("https://")):
-            raise ValueError("URL must start with http:// or https://")
-        if len(value) > 2047:
-            raise ValueError("URL exceeds 2047 characters.")
-        if not urlparse(value).netloc:
-            raise ValueError("URL does not contain a valid hostname.")
-        return value
+    def classify_and_fix(raw):
+        """
+        Returns (bucket_key, fixed_value) for a recognized, validated
+        IOC, or (None, reason_string) for anything that should go to
+        other_list instead.
+        """
+        cleaned = defang_fix(raw)
 
-    def validate_sha256(value):
-        if not re.fullmatch(r"[0-9A-F]{64}", value):
-            raise ValueError("SHA-256 must contain exactly 64 hexadecimal characters.")
-        return value
+        # 1. URL - checked first so a defanged URL's embedded domain
+        # or path never gets misread as a plain domain/IP.
+        if re.match(r"^https?://", cleaned, flags=re.IGNORECASE) or "://" in cleaned:
+            try:
+                return "url_list", validate_url(fix_url(raw))
+            except ValueError as error:
+                return None, str(error)
 
-    fixers = {"IP": fix_ip, "DOMAIN": fix_domain, "URL": fix_url, "SHA256": fix_hash}
-    validators = {
-        "IP": validate_ip,
-        "DOMAIN": validate_domain,
-        "URL": validate_url,
-        "SHA256": validate_sha256,
-    }
-    list_key_for_type = {
-        "IP": "ip_list",
-        "DOMAIN": "domain_list",
-        "URL": "url_list",
-        "SHA256": "sha256_list",
-    }
+        # 2. Hash - pure hex once separators are stripped. Only exact
+        # crypto-hash lengths are treated as "a hash" at all, so a
+        # short hex-looking string still falls through to IP/domain.
+        hex_only = re.sub(r"[\s:-]", "", cleaned)
+        if re.fullmatch(r"[0-9A-Fa-f]+", hex_only) and len(hex_only) in (32, 40, 64):
+            if len(hex_only) == 64:
+                return "sha256_list", hex_only.upper()
+            return None, f"{len(hex_only) * 4}-bit hash (not SHA256) - not blocked by this pipeline."
+
+        # 3. IP
+        try:
+            return "ip_list", validate_ip(cleaned)
+        except ValueError:
+            pass
+
+        # 4. Domain
+        try:
+            return "domain_list", validate_domain(cleaned.rstrip(".").lower())
+        except ValueError:
+            pass
+
+        return None, f"'{raw}' does not match a recognized IOC format (IP/domain/URL/SHA256)."
 
     def _item_scalar(v):
         # SOAR sometimes wraps each item of a multi-item list in its
@@ -219,22 +219,7 @@ def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
                 expanded.append(item)
         return expanded
 
-    # ioc_type additionally gets a plain comma/newline split - type
-    # labels never legitimately contain a comma, unlike indicator
-    # values (a URL's query string can), so this is only safe to do
-    # for ioc_type.
-    def expand_types(raw_list):
-        expanded = expand(raw_list)
-        final = []
-        for item in expanded:
-            if isinstance(item, str) and ("," in item or "\n" in item):
-                final.extend(p.strip() for p in item.replace("\n", ",").split(",") if p.strip())
-            else:
-                final.append(item)
-        return final
-
     indicators = expand(_to_list(indicator))
-    types_raw = expand_types(_to_list(ioc_type))
 
     outputs = {
         "ip_list": "[]",
@@ -256,54 +241,19 @@ def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
         assert json.dumps(outputs)
         return outputs
 
-    if not types_raw:
-        outputs["warning"] = "No 'ioc_type' provided."
-        assert json.dumps(outputs)
-        return outputs
-
-    if len(types_raw) not in (1, len(indicators)):
-        outputs["warning"] = (
-            f"'ioc_type' has {len(types_raw)} value(s) but 'indicator' has "
-            f"{len(indicators)} - pairing by index up to the shorter length."
-        )
-
-    def type_for(index):
-        if len(types_raw) == len(indicators):
-            return types_raw[index]
-        return types_raw[0]
-
     buckets = {"ip_list": [], "domain_list": [], "url_list": [], "sha256_list": []}
     other = []
 
-    pair_count = min(len(indicators), len(types_raw)) if len(types_raw) != 1 else len(indicators)
+    for raw_indicator in indicators:
+        bucket_key, fixed_or_reason = classify_and_fix(raw_indicator)
 
-    for index in range(pair_count):
-        raw_indicator = indicators[index]
-        raw_type = type_for(index)
-        type_label = (raw_type or "").strip().upper()
-        normalized_type = type_aliases.get(type_label)
-
-        if normalized_type is None:
-            other.append({
-                "indicator": raw_indicator,
-                "type": raw_type,
-                "reason": f"Unsupported/unrecognized type '{raw_type}' - not blocked by this pipeline.",
-            })
+        if bucket_key is None:
+            other.append({"indicator": raw_indicator, "reason": fixed_or_reason})
             continue
 
-        try:
-            fixed = fixers[normalized_type](raw_indicator)
-            fixed = validators[normalized_type](fixed)
-        except ValueError as error:
-            other.append({"indicator": raw_indicator, "type": raw_type, "reason": str(error)})
-            continue
-
-        bucket = buckets[list_key_for_type[normalized_type]]
-        if fixed not in bucket:
-            bucket.append(fixed)
-
-    for key, values in buckets.items():
-        outputs[key] = json.dumps(values)
+        bucket = buckets[bucket_key]
+        if fixed_or_reason not in bucket:
+            bucket.append(fixed_or_reason)
 
     count_key_for_list_key = {
         "ip_list": "ip_count",
@@ -311,7 +261,9 @@ def split_iocs_by_type(indicator=None, ioc_type=None, **kwargs):
         "url_list": "url_count",
         "sha256_list": "sha256_count",
     }
+
     for list_key, count_key in count_key_for_list_key.items():
+        outputs[list_key] = json.dumps(buckets[list_key])
         outputs[count_key] = len(buckets[list_key])
 
     outputs["other_list"] = json.dumps(other)
